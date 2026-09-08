@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!--
+      Adaptive icons live in mipmap-anydpi-v26 by convention, which is where every Android
+      toolchain and every reader expects them. Lint points out that the -v26 qualifier is
+      redundant at minSdk 26; the qualifier stays because dropping it is not worth the surprise.
+    -->
+    <issue id="ObsoleteSdkInt">
+        <ignore path="src/main/res/mipmap-anydpi-v26" />
+    </issue>
+
+    <!--
+      Dependency freshness is a deliberate, reviewed decision here rather than something to be
+      nagged about on every build.
+    -->
+    <issue id="GradleDependency" severity="informational" />
+    <issue id="AndroidGradlePluginVersion" severity="informational" />
+</lint>

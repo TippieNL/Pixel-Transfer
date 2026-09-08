@@ -236,7 +236,8 @@ app/                                   Android app (Compose, CameraX)
   pretending.
 * **Video export is a compromise** and is treated as one: H.264 is pinned to an all-keyframe, very
   high bitrate configuration, and refused outright for Dense. Lossless PNG or WebP sequences are the
-  safe export.
+  safe export. A **single still PNG** is offered only when the file genuinely fits in one frame in
+  Robust mode — symbols below `K` are systematic, so frame 0 alone carries every source block.
 * **The performance figures come from a simulated optical channel**, not from two phones on a desk.
   The simulation models the impairments the specification names and is deliberately unkind, but it
   is a model. Real-device numbers will differ.

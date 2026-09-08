@@ -29,6 +29,9 @@ enum class ExportFormat(val label: String, val extension: String, val mimeType: 
 
     /** H.264 at a deliberately extreme bitrate, all keyframes. */
     MP4("H.264 video (.mp4)", "mp4", "video/mp4"),
+
+    /** A single still PNG. Only meaningful when one frame carries the whole file. */
+    SINGLE_FRAME("Single still frame (.png)", "png", "image/png"),
     ;
 }
 
@@ -51,8 +54,17 @@ object StreamExporter {
     class UnsupportedForPalette(val mode: PaletteMode) :
         IllegalArgumentException("${mode.label} cannot survive video compression")
 
-    fun isSupported(format: ExportFormat, mode: PaletteMode): Boolean =
-        format != ExportFormat.MP4 || mode == PaletteMode.ROBUST || mode == PaletteMode.BALANCED
+    class NotASingleFrame :
+        IllegalArgumentException("this file needs more than one frame")
+
+    fun isSupported(format: ExportFormat, mode: PaletteMode): Boolean = when (format) {
+        // Video subsampling destroys the two densest palettes.
+        ExportFormat.MP4 -> mode == PaletteMode.ROBUST || mode == PaletteMode.BALANCED
+        // A still image cannot loop, so it has to be read in one go - which only the most
+        // forgiving palette makes realistic.
+        ExportFormat.SINGLE_FRAME -> mode == PaletteMode.ROBUST
+        else -> true
+    }
 
     suspend fun export(
         context: Context,
@@ -76,7 +88,38 @@ object StreamExporter {
 
             ExportFormat.MP4 ->
                 exportMp4(context, target, renderer, transfer.config.fps, frameCount, onProgress)
+
+            ExportFormat.SINGLE_FRAME -> {
+                if (!transfer.fitsInOneFrame) throw NotASingleFrame()
+                exportStillFrame(context, target, renderer)
+            }
         }
+    }
+
+    /**
+     * Writes frame 0, which carries the systematic symbols - source block i verbatim - and so is
+     * a complete transfer on its own when the file is small enough.
+     */
+    private fun exportStillFrame(
+        context: Context,
+        target: Uri,
+        renderer: FrameBitmapRenderer,
+    ): ExportResult {
+        val bitmap = renderer.newBitmap()
+        var written = 0L
+        try {
+            renderer.render(0, bitmap)
+            context.contentResolver.openOutputStream(target, "wt").use { raw ->
+                requireNotNull(raw) { "cannot write to $target" }
+                val counting = CountingOutputStream(BufferedOutputStream(raw, 256 * 1024))
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, counting)
+                counting.flush()
+                written = counting.count
+            }
+        } finally {
+            bitmap.recycle()
+        }
+        return ExportResult(1, written)
     }
 
     @Suppress("DEPRECATION")

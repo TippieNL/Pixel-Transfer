@@ -36,6 +36,16 @@ class PreparedTransfer(
     /** Payload bytes carried by one frame. */
     val bytesPerFrame: Int get() = symbolsPerFrame * fountainParams.symbolSize
 
+    /**
+     * True when frame 0 alone carries the whole file.
+     *
+     * Symbols below K are systematic - symbol i *is* source block i - so when there are at most
+     * `symbolsPerFrame` blocks, the first frame contains every one of them and no fountain
+     * overhead is needed. This is the only case where a single still image is a complete
+     * transfer, and the only case where exporting one is honest.
+     */
+    val fitsInOneFrame: Boolean get() = sourceBlocks <= symbolsPerFrame
+
     /** Best-case transfer time in seconds: every displayed frame decoded, no losses. */
     fun idealTransferSeconds(fps: Int = config.fps): Double =
         framesPerLoop.toDouble() / fps

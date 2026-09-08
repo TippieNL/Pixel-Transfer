@@ -145,6 +145,14 @@ class SenderViewModel(application: Application) : AndroidViewModel(application) 
                         notice = "Exported ${result.frames} frames, ${formatBytes(result.bytes)}.",
                     )
                 }
+            } catch (e: StreamExporter.NotASingleFrame) {
+                _state.update {
+                    it.copy(
+                        exportProgress = null,
+                        error = "This file needs more than one frame, so a still image cannot " +
+                            "carry it. Export a sequence or a video instead.",
+                    )
+                }
             } catch (e: StreamExporter.UnsupportedForPalette) {
                 _state.update {
                     it.copy(

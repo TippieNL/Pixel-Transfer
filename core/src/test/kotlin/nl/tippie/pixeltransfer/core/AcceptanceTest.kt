@@ -189,6 +189,29 @@ class AcceptanceTest {
     }
 
     @Test
+    fun `a small file exports as one still frame and decodes from it`() {
+        // The degenerate case the sender offers a single PNG for: symbols below K are systematic,
+        // so frame 0 alone carries every source block.
+        val bytes = ByteArray(1200).also { Random(23).nextBytes(it) }
+        val config = SenderConfig(paletteMode = PaletteMode.ROBUST)
+        val sender = Sender(bytes, config)
+        assertTrue(
+            "a ${bytes.size}-byte file should fit in one Robust frame",
+            sender.prepared.fitsInOneFrame,
+        )
+
+        val reader = FrameReader()
+        val decoder = StreamDecoder()
+        val result = reader.read(indoor(seed = 29).capture(sender.display(0), sender.size))
+        assertEquals(ReadStatus.OK, result.status)
+        decoder.accept(result.header!!, result.symbols)
+
+        assertNotNull("one still frame must be a complete transfer", decoder.result)
+        assertTrue(decoder.result!!.sha256Verified)
+        assertArrayEquals(bytes, decoder.result!!.bytes)
+    }
+
+    @Test
     fun `noise and unrelated images never produce a false success`() {
         val reader = FrameReader()
         val decoder = StreamDecoder()

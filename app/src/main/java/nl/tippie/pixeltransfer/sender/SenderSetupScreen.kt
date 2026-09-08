@@ -39,6 +39,15 @@ import nl.tippie.pixeltransfer.ui.StatRow
 import nl.tippie.pixeltransfer.util.formatBytes
 import nl.tippie.pixeltransfer.util.formatDuration
 
+/** Offered file-size caps. The default is 2 MB; above that transfers become tedious. */
+private val FILE_SIZE_LIMITS = listOf(
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+    8 * 1024 * 1024,
+)
+
 @Composable
 fun SenderSetupScreen(
     viewModel: SenderViewModel,
@@ -141,6 +150,23 @@ fun SenderSetupScreen(
             }
         }
 
+        SectionCard("Limits") {
+            Text("Maximum file size", style = MaterialTheme.typography.bodyMedium)
+            ChipRow(
+                options = FILE_SIZE_LIMITS,
+                selected = state.config.maxFileSizeBytes,
+                label = { formatBytes(it.toLong()) },
+                onSelect = viewModel::setMaxFileSize,
+            )
+            Text(
+                "The whole file is held in memory while it is encoded, and a bigger file means a " +
+                    "proportionally longer transfer - there is no way to speed it up beyond the " +
+                    "palette and frame rate.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
         SectionCard("Modulation") {
             Text("Palette", style = MaterialTheme.typography.bodyMedium)
             ChipRow(
@@ -194,13 +220,27 @@ fun SenderSetupScreen(
 
         if (transfer != null) {
             SectionCard("Export the stream") {
+                val formats = ExportFormat.entries.filter {
+                    it != ExportFormat.SINGLE_FRAME || transfer.fitsInOneFrame
+                }
+                // The selection can fall out of range when the file grows past one frame. Resolve
+                // it for display rather than writing state back during composition.
+                val activeFormat = exportFormat.takeIf { it in formats } ?: ExportFormat.PNG_SEQUENCE
                 ChipRow(
-                    options = ExportFormat.entries.toList(),
-                    selected = exportFormat,
+                    options = formats,
+                    selected = activeFormat,
                     label = { it.label },
                     onSelect = { exportFormat = it },
                 )
-                if (!StreamExporter.isSupported(exportFormat, state.config.paletteMode)) {
+                if (transfer.fitsInOneFrame) {
+                    Text(
+                        "This file is small enough that one frame carries all of it, so a single " +
+                            "still image is a complete transfer.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (!StreamExporter.isSupported(activeFormat, state.config.paletteMode)) {
                     Text(
                         "Video compression destroys ${state.config.paletteMode.label}: adjacent " +
                             "levels are too close together to survive chroma subsampling. Use a " +
@@ -212,13 +252,20 @@ fun SenderSetupScreen(
                 state.exportProgress?.let { LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth()) }
                 Button(
                     onClick = {
+                        exportFormat = activeFormat
                         val base = state.file?.displayName?.substringBeforeLast('.') ?: "pixeltransfer"
-                        exportFile.launch("$base-stream.${exportFormat.extension}")
+                        exportFile.launch("$base-stream.${activeFormat.extension}")
                     },
                     enabled = state.exportProgress == null &&
-                        StreamExporter.isSupported(exportFormat, state.config.paletteMode),
+                        StreamExporter.isSupported(activeFormat, state.config.paletteMode),
                 ) {
-                    Text("Export ${transfer.framesPerLoop} frames")
+                    Text(
+                        if (activeFormat == ExportFormat.SINGLE_FRAME) {
+                            "Export one frame"
+                        } else {
+                            "Export ${transfer.framesPerLoop} frames"
+                        },
+                    )
                 }
             }
         }

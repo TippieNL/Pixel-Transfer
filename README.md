@@ -3,8 +3,19 @@
 Transfer a file between two nearby Android devices with **no Bluetooth, no Wi-Fi, no mobile data,
 no NFC and no internet**. The only channel is one phone's screen and the other phone's camera.
 
-The app declares exactly one permission — `CAMERA`. There is no networking permission of any
-kind, so the "no internet" property is verifiable from the manifest rather than merely claimed.
+The only platform permission the app requests is `CAMERA`. There is no `INTERNET`, no
+`ACCESS_NETWORK_STATE`, no Bluetooth, no NFC and no location permission, so the "no internet"
+property is verifiable from the built APK rather than merely claimed:
+
+```
+$ aapt2 dump permissions PixelTransfer-release.apk
+uses-permission: name='android.permission.CAMERA'
+uses-permission: name='nl.tippie.pixeltransfer.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
+```
+
+The second entry is not a platform permission. It is a signature-level permission the app defines
+for itself, injected automatically by `androidx.core` to guard non-exported dynamic broadcast
+receivers on Android 13+. It grants nothing outside the app.
 
 ---
 

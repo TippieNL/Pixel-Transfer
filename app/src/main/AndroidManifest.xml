@@ -2,9 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!--
-      PixelTransfer moves files over an optical link only: one screen, one camera. It requests
-      no networking permission of any kind, which is what makes the "no internet" property
-      verifiable rather than merely claimed.
+      PixelTransfer moves files over an optical link only: one screen, one camera. CAMERA is the
+      only platform permission it asks for - no INTERNET, no ACCESS_NETWORK_STATE, no Bluetooth,
+      no NFC, no location - which is what makes the "no internet" property verifiable from the
+      built APK rather than merely claimed.
+
+      androidx.core additionally injects a signature-level permission of its own
+      (${applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION) to guard non-exported dynamic
+      broadcast receivers on Android 13+. It is self-defined and grants nothing outside the app.
     -->
     <uses-permission android:name="android.permission.CAMERA" />
 

@@ -20,6 +20,17 @@ data class SenderConfig(
     /** null means "decide by measuring". */
     val compression: CompressionType? = CompressionType.DEFLATE,
     val maxFileSizeBytes: Int = DEFAULT_MAX_FILE_SIZE,
+    /** Bytes per independently coded segment. */
+    val segmentSizeBytes: Int = SegmentPlan.DEFAULT_SEGMENT_SIZE,
+    /**
+     * Frames spent on each segment relative to the theoretical minimum.
+     *
+     * With no back channel the sender cannot know when a segment has landed, so it shows each one
+     * for longer than strictly necessary and then moves on. Too little margin and most receivers
+     * need a second pass over the whole file; too much and every receiver waits for frames it
+     * already has.
+     */
+    val segmentRedundancy: Double = DEFAULT_SEGMENT_REDUNDANCY,
 ) {
     init {
         require(cellSizePx in MIN_CELL_SIZE..MAX_CELL_SIZE) {
@@ -30,6 +41,8 @@ data class SenderConfig(
             "grid must be even and at least ${FrameLayout.MIN_GRID}"
         }
         require(blockSize in 64..8192) { "block size must be 64..8192 bytes" }
+        require(segmentSizeBytes >= 64 * 1024) { "segment size must be at least 64 KiB" }
+        require(segmentRedundancy in 1.0..4.0) { "segment redundancy must be 1.0..4.0" }
     }
 
     /** Pixel width/height of the rendered code including the quiet border. */
@@ -40,7 +53,9 @@ data class SenderConfig(
         const val DEFAULT_CELL_SIZE = 8
         const val DEFAULT_BLOCK_SIZE = 1024
         const val DEFAULT_FPS = 12
-        const val DEFAULT_MAX_FILE_SIZE = 2 * 1024 * 1024
+        const val DEFAULT_MAX_FILE_SIZE = 150 * 1024 * 1024
+
+        const val DEFAULT_SEGMENT_REDUNDANCY = 1.5
 
         /**
          * A 1:1 mapping onto physical screen pixels is not recoverable by any phone camera, so
@@ -62,5 +77,8 @@ data class SenderConfig(
 
         /** Warn about transfer time above this size. */
         const val SLOW_TRANSFER_WARNING_BYTES = 512 * 1024
+
+        /** Above this, warn that the transfer runs for tens of minutes and must not be disturbed. */
+        const val VERY_SLOW_TRANSFER_BYTES = 20 * 1024 * 1024
     }
 }

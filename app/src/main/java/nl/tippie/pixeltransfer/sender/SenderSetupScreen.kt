@@ -15,6 +15,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.foundation.layout.Column
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -47,11 +48,10 @@ import nl.tippie.pixeltransfer.util.formatDuration
 private val GRID_SIZES = listOf(64, 80, 96, 128)
 
 private val FILE_SIZE_LIMITS = listOf(
-    512 * 1024,
-    1024 * 1024,
     2 * 1024 * 1024,
-    4 * 1024 * 1024,
     8 * 1024 * 1024,
+    32 * 1024 * 1024,
+    150 * 1024 * 1024,
 )
 
 @Composable
@@ -97,6 +97,15 @@ fun SenderSetupScreen(
 
         state.error?.let { Banner(it, BannerTone.ERROR) }
         state.notice?.let { Banner(it, BannerTone.INFO) }
+        state.hashProgress?.let { progress ->
+            Column {
+                Text(
+                    "Hashing the file (${"%.0f".format(progress * 100)}%)",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+            }
+        }
 
         SectionCard("File") {
             val file = state.file
@@ -109,7 +118,7 @@ fun SenderSetupScreen(
             } else {
                 StatRow("Name", file.displayName)
                 StatRow("Type", file.mimeType)
-                StatRow("Size", formatBytes(file.bytes.size.toLong()))
+                StatRow("Size", formatBytes(file.size))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { pickFile.launch(arrayOf("*/*")) }) { Text("Choose file") }
@@ -128,8 +137,14 @@ fun SenderSetupScreen(
                         "(${"%.0f".format(transfer.metadata.compressionRatio * 100)}% of original)",
                 )
                 StatRow("Compression", transfer.metadata.compression.name)
-                StatRow("Source blocks (K)", "${transfer.sourceBlocks} x ${transfer.fountainParams.symbolSize} B")
-                StatRow("Symbols needed", "${transfer.symbolsNeeded}")
+                if (transfer.segments.count > 1) {
+                    StatRow(
+                        "Segments",
+                        "${transfer.segments.count} x ${formatBytes(transfer.config.segmentSizeBytes.toLong())}",
+                    )
+                }
+                StatRow("Source blocks (K)", "${transfer.sourceBlocks} x ${transfer.blockSize} B per segment")
+                StatRow("Symbols needed", "${transfer.symbolsNeeded} per segment")
                 StatRow("Symbols per frame", "${transfer.symbolsPerFrame}")
                 StatRow("Payload per frame", formatBytes(transfer.bytesPerFrame.toLong()))
                 StatRow("Frames per loop", "${transfer.framesPerLoop}")
@@ -147,7 +162,18 @@ fun SenderSetupScreen(
                 )
             }
 
-            if (state.slowTransferWarning) {
+            if (state.verySlowTransferWarning) {
+                Banner(
+                    "This is a ${formatBytes(state.file?.size ?: 0)} transfer over a screen and a " +
+                        "camera - about ${formatDuration(transfer.estimatedTransferSeconds())} of " +
+                        "both phones held still, plugged in, with nothing else running. The link " +
+                        "carries roughly ${formatBytes((transfer.bytesPerFrame.toLong() * state.config.fps))} " +
+                        "per second; there is no way around that. Raising the frame rate, the grid " +
+                        "size or the palette density all help, at the cost of needing a better " +
+                        "capture.",
+                    BannerTone.WARNING,
+                )
+            } else if (state.slowTransferWarning) {
                 Banner(
                     "This file is over 512 KB. Expect the transfer to take a while and the phones " +
                         "to need holding steady throughout.",
@@ -156,7 +182,7 @@ fun SenderSetupScreen(
             }
             if (state.blockSizeReduced) {
                 Banner(
-                    "Source blocks were reduced to ${transfer.fountainParams.symbolSize} bytes: a " +
+                    "Source blocks were reduced to ${transfer.blockSize} bytes: a " +
                         "${state.config.blockSize}-byte symbol does not fit in one frame in " +
                         "${state.config.paletteMode.label}.",
                     BannerTone.INFO,
@@ -173,9 +199,9 @@ fun SenderSetupScreen(
                 onSelect = viewModel::setMaxFileSize,
             )
             Text(
-                "The whole file is held in memory while it is encoded, and a bigger file means a " +
-                    "proportionally longer transfer - there is no way to speed it up beyond the " +
-                    "palette and frame rate.",
+                "Large files are streamed a segment at a time, so size costs time rather than " +
+                    "memory. Transfer time is proportional to size: budget roughly a minute per " +
+                    "3 MB at the default settings.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -248,7 +274,20 @@ fun SenderSetupScreen(
             )
         }
 
-        if (transfer != null) {
+        if (transfer != null && transfer.segments.count > 1) {
+            SectionCard("Export the stream") {
+                Text(
+                    "This transfer is ${transfer.segments.count} segments and " +
+                        "${transfer.framesPerLoop} frames per pass. Exporting it would produce a " +
+                        "file far larger than the original, so export is offered only for " +
+                        "single-segment transfers.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        if (transfer != null && transfer.segments.count == 1) {
             SectionCard("Export the stream") {
                 val formats = ExportFormat.entries.filter {
                     it != ExportFormat.SINGLE_FRAME || transfer.fitsInOneFrame

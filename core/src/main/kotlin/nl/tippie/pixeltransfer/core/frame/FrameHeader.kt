@@ -55,6 +55,8 @@ data class FrameHeader(
     val frameSequence: Int,
     val nonce: Int,
     val symbolsInFrame: Int,
+    val segmentIndex: Int = 0,
+    val segmentCount: Int = 1,
     val flags: Int = 0,
 ) {
 
@@ -76,13 +78,15 @@ data class FrameHeader(
         ByteIo.putShort(out, 24, nonce)
         out[26] = symbolsInFrame.toByte()
         out[27] = flags.toByte()
-        ByteIo.putInt(out, 28, Crc32.of(out, 0, 28))
+        ByteIo.putShort(out, 28, segmentIndex)
+        ByteIo.putShort(out, 30, segmentCount)
+        ByteIo.putInt(out, 32, Crc32.of(out, 0, 32))
         return out
     }
 
     companion object {
-        const val SIZE = 32
-        const val VERSION = 1
+        const val SIZE = 36
+        const val VERSION = 2
 
         /** Parity bytes protecting the header, independent of the payload ECC level. */
         const val RS_PARITY = 16
@@ -94,7 +98,7 @@ data class FrameHeader(
             if (bytes.size < SIZE) return null
             if (bytes[0] != 'P'.code.toByte() || bytes[1] != 'X'.code.toByte() || bytes[2] != 'T'.code.toByte()) return null
             if ((bytes[3].toInt() and 0xFF) != VERSION) return null
-            if (Crc32.of(bytes, 0, 28) != ByteIo.getInt(bytes, 28)) return null
+            if (Crc32.of(bytes, 0, 32) != ByteIo.getInt(bytes, 32)) return null
 
             val mode = PaletteMode.fromId(bytes[16].toInt() and 0xFF) ?: return null
             val ecc = EccLevel.fromId(bytes[18].toInt() and 0xFF) ?: return null
@@ -102,7 +106,10 @@ data class FrameHeader(
             val blocks = ByteIo.getShort(bytes, 12)
             val blockSize = ByteIo.getShort(bytes, 14)
             val total = ByteIo.getInt(bytes, 8)
+            val segmentIndex = ByteIo.getShort(bytes, 28)
+            val segmentCount = ByteIo.getShort(bytes, 30)
             if (blocks <= 0 || blockSize <= 0 || total <= 0) return null
+            if (segmentCount <= 0 || segmentIndex >= segmentCount) return null
 
             return FrameHeader(
                 streamId = ByteIo.getInt(bytes, 4),
@@ -116,6 +123,8 @@ data class FrameHeader(
                 frameSequence = ByteIo.getInt(bytes, 20),
                 nonce = ByteIo.getShort(bytes, 24),
                 symbolsInFrame = bytes[26].toInt() and 0xFF,
+                segmentIndex = segmentIndex,
+                segmentCount = segmentCount,
                 flags = bytes[27].toInt() and 0xFF,
             )
         }

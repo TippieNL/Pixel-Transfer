@@ -18,6 +18,7 @@ import nl.tippie.pixeltransfer.core.pipeline.SenderConfig
 import nl.tippie.pixeltransfer.core.pipeline.TransferPreparation
 import nl.tippie.pixeltransfer.util.FileIo
 import nl.tippie.pixeltransfer.util.PickedFile
+import nl.tippie.pixeltransfer.util.UriTransferSource
 import nl.tippie.pixeltransfer.util.formatBytes
 
 data class SenderUiState(
@@ -25,17 +26,23 @@ data class SenderUiState(
     val transfer: PreparedTransfer? = null,
     val config: SenderConfig = SenderConfig(),
     val busy: Boolean = false,
+    /** 0..1 while the file is being hashed, which is a real wait for a large video. */
+    val hashProgress: Float? = null,
     val error: String? = null,
     val notice: String? = null,
     val exportProgress: Float? = null,
 ) {
     /** True when the transfer is large enough that the user should be told it will take a while. */
     val slowTransferWarning: Boolean
-        get() = (file?.bytes?.size ?: 0) > SenderConfig.SLOW_TRANSFER_WARNING_BYTES
+        get() = (file?.size ?: 0L) > SenderConfig.SLOW_TRANSFER_WARNING_BYTES
+
+    /** True when the transfer will run for tens of minutes and must not be interrupted. */
+    val verySlowTransferWarning: Boolean
+        get() = (file?.size ?: 0L) > SenderConfig.VERY_SLOW_TRANSFER_BYTES
 
     /** Set when the requested source block size had to be reduced to fit a frame. */
     val blockSizeReduced: Boolean
-        get() = transfer != null && transfer.fountainParams.symbolSize != config.blockSize
+        get() = transfer != null && transfer.blockSize != config.blockSize
 }
 
 class SenderViewModel(application: Application) : AndroidViewModel(application) {
@@ -50,9 +57,9 @@ class SenderViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             _state.update { it.copy(busy = true, error = null, notice = null) }
             try {
-                val limit = _state.value.config.maxFileSizeBytes
+                val limit = _state.value.config.maxFileSizeBytes.toLong()
                 val file = withContext(Dispatchers.IO) {
-                    FileIo.read(getApplication(), uri, limit)
+                    FileIo.describe(getApplication(), uri, limit)
                 }
                 _state.update { it.copy(file = file) }
                 prepare()
@@ -61,8 +68,8 @@ class SenderViewModel(application: Application) : AndroidViewModel(application) 
                     it.copy(
                         busy = false,
                         error = "That file is ${formatBytes(e.size)}. The limit is " +
-                            "${formatBytes(e.limit.toLong())} - raise it in the settings below if " +
-                            "you are willing to wait.",
+                            "${formatBytes(e.limit)} - raise it in the settings below if you are " +
+                            "willing to wait.",
                     )
                 }
             } catch (e: Exception) {
@@ -161,17 +168,36 @@ class SenderViewModel(application: Application) : AndroidViewModel(application) 
     private fun prepare() {
         val file = _state.value.file ?: return
         viewModelScope.launch {
-            _state.update { it.copy(busy = true, error = null) }
+            _state.update { it.copy(busy = true, error = null, hashProgress = 0f) }
             try {
                 val config = _state.value.config
-                val transfer = withContext(Dispatchers.Default) {
-                    TransferPreparation.prepare(file.displayName, file.mimeType, file.bytes, config)
+                val transfer = withContext(Dispatchers.IO) {
+                    // The source stays open for the life of the transfer; the encoder reads one
+                    // segment at a time from it rather than the app holding the file.
+                    val source = UriTransferSource(getApplication(), file.uri, file.size)
+                    TransferPreparation.prepare(
+                        file.displayName, file.mimeType, source, config,
+                    ) { done, total ->
+                        _state.update { it.copy(hashProgress = (done.toDouble() / total).toFloat()) }
+                    }
                 }
-                _state.update { it.copy(transfer = transfer, busy = false) }
+                _state.update { it.copy(transfer = transfer, busy = false, hashProgress = null) }
             } catch (e: TransferPreparation.TooSmallGrid) {
-                _state.update { it.copy(busy = false, transfer = null, error = e.message) }
+                _state.update { it.copy(busy = false, hashProgress = null, transfer = null, error = e.message) }
+            } catch (e: OutOfMemoryError) {
+                _state.update {
+                    it.copy(
+                        busy = false, hashProgress = null, transfer = null,
+                        error = "Ran out of memory preparing that file. Try a smaller segment size.",
+                    )
+                }
             } catch (e: Exception) {
-                _state.update { it.copy(busy = false, transfer = null, error = "Could not prepare the transfer: ${e.message}") }
+                _state.update {
+                    it.copy(
+                        busy = false, hashProgress = null, transfer = null,
+                        error = "Could not prepare the transfer: ${e.message}",
+                    )
+                }
             }
         }
     }

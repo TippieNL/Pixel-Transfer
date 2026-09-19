@@ -25,12 +25,17 @@ import nl.tippie.pixeltransfer.core.vision.ReadStatus
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Where the receiver is in the transfer. */
-enum class ReceiverPhase { SEARCHING, RECEIVING, COMPLETE, FAILED }
+enum class ReceiverPhase { SEARCHING, RECEIVING, VERIFYING, COMPLETE, FAILED }
 
 data class ReceiverUiState(
     val phase: ReceiverPhase = ReceiverPhase.SEARCHING,
     val metadata: FileMetadata? = null,
     val sourceBlocks: Int = 0,
+    val segmentCount: Int = 0,
+    val segmentsComplete: Int = 0,
+    val currentSegment: Int = -1,
+    /** Overall progress across every segment, 0..1. */
+    val overallProgress: Float = 0f,
     val blocksRecovered: Int = 0,
     val symbolsUnique: Int = 0,
     val symbolsNeeded: Int = 0,
@@ -56,10 +61,14 @@ data class ReceiverUiState(
     val clippedFraction: Double = 0.0,
     val failure: FailureReason? = null,
     val savedTo: String? = null,
+    /** Set when the incoming file will not fit in the space available. */
+    val insufficientSpace: Boolean = false,
     val error: String? = null,
 ) {
     val blockProgress: Float
         get() = if (sourceBlocks == 0) 0f else blocksRecovered.toFloat() / sourceBlocks
+
+    val isSegmented: Boolean get() = segmentCount > 1
 
     val symbolProgress: Float
         get() = if (symbolsNeeded == 0) 0f else (symbolsUnique.toFloat() / symbolsNeeded).coerceAtMost(1f)
@@ -68,12 +77,14 @@ data class ReceiverUiState(
     val estimatedSecondsRemaining: Double?
         get() {
             if (phase != ReceiverPhase.RECEIVING) return null
-            val remaining = symbolsNeeded - symbolsUnique
-            if (remaining <= 0) return 0.0
-            if (goodFramesPerSecond <= 0.01f || framesDecoded == 0) return null
-            val symbolsPerGoodFrame = symbolsUnique.toDouble() / framesDecoded
-            if (symbolsPerGoodFrame <= 0.0) return null
-            return remaining / (symbolsPerGoodFrame * goodFramesPerSecond)
+            if (goodFramesPerSecond <= 0.01f || framesDecoded == 0 || overallProgress <= 0.001f) {
+                return null
+            }
+            // Extrapolate from progress actually made rather than from the current segment alone,
+            // which would read as "nearly done" once per segment on a long transfer.
+            val elapsedRate = overallProgress / framesDecoded.toDouble()
+            val framesLeft = (1.0 - overallProgress) / elapsedRate
+            return framesLeft / goodFramesPerSecond
         }
 }
 
@@ -88,8 +99,14 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
 
     private val reader = FrameReader()
     private val converter = YuvConverter()
-    private val decoder = StreamDecoder()
+    private val store = ReceivedFileStore(application)
+
+    // Segments are written straight to disk as they complete, so a 150 MB transfer needs only a
+    // segment's worth of memory rather than the whole file.
+    private var decoder = StreamDecoder(sink = store.newSink())
     private val decoding = AtomicBoolean(false)
+    private var verified: ReceivedFileStore.Verified? = null
+    private val verifying = AtomicBoolean(false)
 
     private var governor: ExposureGovernor? = null
     private var consecutiveGood = 0
@@ -167,6 +184,7 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
             var gained = false
             if (result.isUsable) {
                 gained = decoder.accept(result.header!!, result.symbols)
+                if (decoder.allSegmentsRecovered) verifyInBackground()
                 consecutiveGood++
                 framesSinceRemeter = 0
                 readyToLock = consecutiveGood >= GOOD_FRAMES_BEFORE_LOCK &&
@@ -213,9 +231,10 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
             (recentGood.size - 1) * 1_000_000_000f / span
         }
 
-        val result = decoder.result
+        val finished = verified
         val phase = when {
-            result != null -> ReceiverPhase.COMPLETE
+            finished != null -> if (finished.sha256Verified) ReceiverPhase.COMPLETE else ReceiverPhase.FAILED
+            decoder.allSegmentsRecovered -> ReceiverPhase.VERIFYING
             decoder.failure != null -> ReceiverPhase.FAILED
             decoder.header != null -> ReceiverPhase.RECEIVING
             else -> ReceiverPhase.SEARCHING
@@ -224,7 +243,12 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
         _state.update { previous ->
             previous.copy(
                 phase = phase,
-                metadata = decoder.metadata ?: previous.metadata,
+                metadata = finished?.metadata ?: decoder.metadata ?: previous.metadata,
+                insufficientSpace = (decoder.metadata?.originalSize?.toLong() ?: 0L) > freeSpace(),
+                segmentCount = decoder.segmentCount,
+                segmentsComplete = decoder.segmentsComplete,
+                currentSegment = decoder.currentSegment,
+                overallProgress = decoder.progress,
                 sourceBlocks = decoder.sourceBlocks,
                 blocksRecovered = decoder.blocksRecovered,
                 symbolsUnique = decoder.symbolsUnique,
@@ -240,7 +264,7 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
                 hints = Guidance.hints(status, diagnostics, recentGood.size, recentAttempts),
                 overlay = overlay ?: previous.overlay.takeIf { status != ReadStatus.NO_FINDERS },
                 overlayAspect = aspect,
-                sha256Verified = result?.sha256Verified ?: false,
+                sha256Verified = finished?.sha256Verified ?: false,
                 exposureIndex = governor?.index ?: 0,
                 exposureSettled = governor?.isSettled ?: false,
                 clippedFraction = exposure.clippedFraction,
@@ -249,8 +273,40 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    private fun verifyInBackground() {
+        if (!verifying.compareAndSet(false, true)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val outcome = runCatching { store.finish() }.getOrNull()
+            verified = outcome
+            _state.update {
+                it.copy(
+                    phase = when {
+                        outcome == null -> ReceiverPhase.FAILED
+                        outcome.sha256Verified -> ReceiverPhase.COMPLETE
+                        else -> ReceiverPhase.FAILED
+                    },
+                    metadata = outcome?.metadata ?: it.metadata,
+                    sha256Verified = outcome?.sha256Verified ?: false,
+                    failure = if (outcome != null && !outcome.sha256Verified) {
+                        FailureReason.HASH_MISMATCH
+                    } else if (outcome == null) {
+                        FailureReason.CORRUPT_METADATA
+                    } else {
+                        null
+                    },
+                    overallProgress = 1f,
+                )
+            }
+        }
+    }
+
+    /** Free space where the incoming file will land. */
+    fun freeSpace(): Long = store.freeSpace()
+
     fun reset() {
-        decoder.reset()
+        verified = null
+        verifying.set(false)
+        decoder = StreamDecoder(sink = store.newSink())
         recentGood.clear()
         recentAttempts = 0
         consecutiveGood = 0
@@ -262,23 +318,24 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
 
     /** Writes the received file to a location the user picked. */
     fun save(target: Uri) {
-        val received = decoder.result ?: return
+        val finished = verified ?: return
         viewModelScope.launch {
             try {
-                withContext(Dispatchers.IO) {
-                    nl.tippie.pixeltransfer.util.FileIo.write(getApplication(), target, received.bytes)
-                }
-                _state.update { it.copy(savedTo = received.metadata.fileName, error = null) }
+                withContext(Dispatchers.IO) { store.saveTo(finished, target) }
+                _state.update { it.copy(savedTo = finished.metadata.fileName, error = null) }
             } catch (e: Exception) {
                 _state.update { it.copy(error = "Could not save the file: ${e.message}") }
             }
         }
     }
 
-    fun suggestedFileName(): String = decoder.result?.metadata?.fileName ?: "received.bin"
+    override fun onCleared() {
+        super.onCleared()
+        // The scratch file is only useful while the screen is open.
+        if (verified == null) store.clear()
+    }
 
-    fun suggestedMimeType(): String =
-        decoder.result?.metadata?.mimeType ?: "application/octet-stream"
+    fun suggestedFileName(): String = verified?.metadata?.fileName ?: "received.bin"
 
     private companion object {
         const val RATE_WINDOW_NANOS = 3_000_000_000L

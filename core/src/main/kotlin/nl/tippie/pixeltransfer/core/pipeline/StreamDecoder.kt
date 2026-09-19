@@ -32,8 +32,16 @@ enum class FailureReason {
  *
  * This class deliberately knows nothing about cameras or images: it is fed whatever the frame
  * decoder managed to read, in whatever order, with whatever gaps.
+ *
+ * A transfer may be cut into segments, each coded independently. Only a bounded number of
+ * partially-decoded segments are kept alive at once; the sender cycles through segments anyway, so
+ * dropping the least recently seen partial state costs one more pass at worst, whereas keeping
+ * every segment resident would need as much memory as the whole file.
  */
 class StreamDecoder(
+    /** Where completed segments are written. Null keeps the whole object in memory. */
+    private val sink: SegmentSink? = null,
+    private val maxLiveSegments: Int = DEFAULT_LIVE_SEGMENTS,
     /**
      * How many consecutive frames from a different stream it takes to abandon the current one.
      * Lets the user point the camera at a second transfer without restarting the app.
@@ -44,8 +52,18 @@ class StreamDecoder(
     var header: FrameHeader? = null
         private set
 
-    private var fountain: FountainDecoder? = null
+    /** Fountain decoders for segments still in progress, most recently used last. */
+    private val live = LinkedHashMap<Int, FountainDecoder>()
+
+    /** Completed segment bytes, held only when there is no sink to write them to. */
+    private val buffered = HashMap<Int, ByteArray>()
+
+    private var completed: BooleanArray = BooleanArray(0)
+    private var fullSegmentSize = -1
     private var foreignRun = 0
+
+    var segmentCount: Int = 0
+        private set
 
     var metadata: FileMetadata? = null
         private set
@@ -66,25 +84,51 @@ class StreamDecoder(
     var symbolsDuplicate: Int = 0
         private set
 
-    val isComplete: Boolean get() = result != null
+    /** True once every segment has been recovered. With a sink the bytes are already written. */
+    var allSegmentsRecovered: Boolean = false
+        private set
+
+    val isComplete: Boolean get() = result != null || (sink != null && allSegmentsRecovered)
+
+    val segmentsComplete: Int get() = completed.count { it }
+
+    /** Index of the segment currently being received, or -1. */
+    var currentSegment: Int = -1
+        private set
 
     val sourceBlocks: Int get() = header?.sourceBlocks ?: 0
 
-    val blocksRecovered: Int get() = fountain?.recoveredBlocks ?: 0
+    val blocksRecovered: Int get() = live[currentSegment]?.recoveredBlocks ?: 0
 
-    /** Symbols still needed, including the fountain code's reception overhead. */
+    /** Symbols still needed for the current segment, including the fountain overhead. */
     val symbolsNeeded: Int
         get() = header?.let { ceil(it.sourceBlocks * PreparedTransfer.RECEPTION_OVERHEAD).toInt() } ?: 0
 
-    /** 0..1 over source blocks recovered. */
-    val progress: Float get() = fountain?.progress ?: 0f
+    /** Overall progress across every segment, 0..1. */
+    val progress: Float
+        get() {
+            if (segmentCount == 0) return 0f
+            val within = live[currentSegment]?.progress ?: 0f
+            val done = segmentsComplete
+            val partial = if (currentSegment >= 0 && !completedAt(currentSegment)) within else 0f
+            return ((done + partial) / segmentCount).coerceIn(0f, 1f)
+        }
+
+    private fun completedAt(index: Int): Boolean =
+        index in completed.indices && completed[index]
 
     fun reset() {
         header = null
-        fountain = null
+        live.clear()
+        buffered.clear()
+        completed = BooleanArray(0)
+        fullSegmentSize = -1
+        segmentCount = 0
+        currentSegment = -1
         metadata = null
         result = null
         failure = null
+        allSegmentsRecovered = false
         foreignRun = 0
         framesAccepted = 0
         framesFromOtherStream = 0
@@ -92,9 +136,7 @@ class StreamDecoder(
         symbolsDuplicate = 0
     }
 
-    /**
-     * Feeds one decoded frame. Returns true when at least one new symbol was absorbed.
-     */
+    /** Feeds one decoded frame. Returns true when at least one new symbol was absorbed. */
     fun accept(frameHeader: FrameHeader, symbols: List<SymbolPacket>): Boolean {
         if (isComplete) return false
 
@@ -110,13 +152,23 @@ class StreamDecoder(
             adopt(frameHeader)
         } else {
             foreignRun = 0
+            header = frameHeader
         }
 
-        val decoder = fountain ?: return false
-        val expected = header!!.blockSize
+        val segment = frameHeader.segmentIndex
+        if (segment !in completed.indices) return false
+        currentSegment = segment
+        framesAccepted++
+        if (completed[segment]) return false
+
+        if (frameHeader.segmentIndex < frameHeader.segmentCount - 1) {
+            fullSegmentSize = frameHeader.totalEncodedSize
+        }
+
+        val decoder = decoderFor(segment, frameHeader)
         var gained = false
         for (packet in symbols) {
-            if (packet.data.size != expected) continue
+            if (packet.data.size != frameHeader.blockSize) continue
             if (packet.esi < 0) continue
             if (decoder.hasSeen(packet.esi)) {
                 symbolsDuplicate++
@@ -127,22 +179,44 @@ class StreamDecoder(
                 gained = true
             }
         }
-        framesAccepted++
 
         if (gained) {
-            peekMetadata(decoder)
-            if (!decoder.isComplete && symbolsUnique >= header!!.sourceBlocks) decoder.tryFinish()
-            if (decoder.isComplete) finish(decoder)
+            if (segment == 0) peekMetadata(decoder)
+            if (!decoder.isComplete && decoder.symbolsAccepted >= frameHeader.sourceBlocks) {
+                decoder.tryFinish()
+            }
+            if (decoder.isComplete) finishSegment(segment, frameHeader, decoder)
         }
         return gained
     }
 
     private fun adopt(frameHeader: FrameHeader) {
         header = frameHeader
+        segmentCount = frameHeader.segmentCount
+        completed = BooleanArray(segmentCount)
         foreignRun = 0
-        fountain = FountainDecoder(
-            FountainParams(frameHeader.sourceBlocks, frameHeader.blockSize, frameHeader.streamId),
+    }
+
+    private fun decoderFor(segment: Int, frameHeader: FrameHeader): FountainDecoder {
+        live[segment]?.let {
+            // Refresh recency so the segment being worked on is never the one evicted.
+            live.remove(segment)
+            live[segment] = it
+            return it
+        }
+        while (live.size >= maxLiveSegments) {
+            val oldest = live.keys.first()
+            live.remove(oldest)
+        }
+        val decoder = FountainDecoder(
+            FountainParams(
+                frameHeader.sourceBlocks,
+                frameHeader.blockSize,
+                StreamEncoder.segmentStreamId(frameHeader.streamId, segment),
+            ),
         )
+        live[segment] = decoder
+        return decoder
     }
 
     /** Surfaces the filename as soon as the leading blocks are in, long before the whole file. */
@@ -153,9 +227,61 @@ class StreamDecoder(
         metadata = FileMetadata.decode(prefix)?.metadata
     }
 
-    private fun finish(decoder: FountainDecoder) {
-        val head = header ?: return
-        val obj = decoder.assemble(head.totalEncodedSize)
+    private fun finishSegment(segment: Int, frameHeader: FrameHeader, decoder: FountainDecoder) {
+        val bytes = decoder.assemble(frameHeader.totalEncodedSize)
+        completed[segment] = true
+        live.remove(segment)
+
+        if (sink != null) {
+            val offset = offsetOf(segment)
+            if (offset >= 0) {
+                sink.write(offset, bytes, bytes.size)
+            } else {
+                // The segment size is not known yet; hold on until a full segment identifies it.
+                buffered[segment] = bytes
+            }
+            flushBuffered()
+        } else {
+            buffered[segment] = bytes
+        }
+
+        if (segment == 0) metadata = FileMetadata.decode(bytes)?.metadata ?: metadata
+
+        if (completed.all { it }) {
+            allSegmentsRecovered = true
+            if (sink == null) assembleInMemory()
+        }
+    }
+
+    private fun offsetOf(segment: Int): Long = when {
+        segmentCount == 1 -> 0L
+        fullSegmentSize > 0 -> segment.toLong() * fullSegmentSize
+        else -> -1L
+    }
+
+    private fun flushBuffered() {
+        if (sink == null || buffered.isEmpty()) return
+        val iterator = buffered.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            val offset = offsetOf(entry.key)
+            if (offset < 0) continue
+            sink.write(offset, entry.value, entry.value.size)
+            iterator.remove()
+        }
+    }
+
+    /** Small transfers are reconstructed, decompressed and verified here. */
+    private fun assembleInMemory() {
+        val totalSize = buffered.values.sumOf { it.size }
+        val obj = ByteArray(totalSize)
+        var offset = 0
+        for (index in 0 until segmentCount) {
+            val part = buffered[index] ?: return
+            part.copyInto(obj, offset)
+            offset += part.size
+        }
+
         val parsed = FileMetadata.decode(obj)
         if (parsed == null) {
             failure = FailureReason.CORRUPT_METADATA
@@ -187,5 +313,14 @@ class StreamDecoder(
             return
         }
         result = ReceivedFile(meta, plain, sha256Verified = true)
+        buffered.clear()
+    }
+
+    private companion object {
+        /**
+         * Partially-decoded segments kept resident. The sender cycles, so evicting the least
+         * recently seen costs one more pass at worst.
+         */
+        const val DEFAULT_LIVE_SEGMENTS = 2
     }
 }

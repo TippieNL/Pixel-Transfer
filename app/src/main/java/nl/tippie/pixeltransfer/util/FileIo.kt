@@ -5,60 +5,74 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
-import java.io.ByteArrayOutputStream
 import java.util.Locale
 
-/** A file picked by the user, loaded into memory. Transfers are capped at a couple of megabytes. */
+/**
+ * A document the user picked, described but *not* read.
+ *
+ * Large transfers are streamed a segment at a time, so the bytes stay where they are until the
+ * encoder asks for them.
+ */
 class PickedFile(
     val uri: Uri,
     val displayName: String,
     val mimeType: String,
-    val bytes: ByteArray,
+    val size: Long,
 )
 
 object FileIo {
 
-    class TooLarge(val size: Long, val limit: Int) : Exception("file is $size bytes, limit is $limit")
+    class TooLarge(val size: Long, val limit: Long) :
+        Exception("file is $size bytes, limit is $limit")
+
+    class Unreadable(message: String) : Exception(message)
 
     /**
-     * Reads a document the user picked through the Storage Access Framework.
+     * Reads a document's name, type and size without opening its contents.
      *
-     * The size is checked before the read so that pointing the picker at a video does not push
-     * the process into an out-of-memory kill.
+     * Where the provider does not report a size, the stream is measured by skipping through it -
+     * still without materialising anything.
      */
-    fun read(context: Context, uri: Uri, limit: Int): PickedFile {
+    fun describe(context: Context, uri: Uri, limit: Long): PickedFile {
         val resolver = context.contentResolver
         val name = queryDisplayName(resolver, uri) ?: uri.lastPathSegment ?: "file.bin"
-        val declaredSize = queryLength(resolver, uri)
-        if (declaredSize != null && declaredSize > limit) throw TooLarge(declaredSize, limit)
-
-        val bytes = resolver.openInputStream(uri).use { input ->
-            requireNotNull(input) { "cannot open $uri" }
-            val buffer = ByteArrayOutputStream(
-                (declaredSize ?: 64 * 1024L).coerceAtMost(limit.toLong()).toInt(),
-            )
-            val chunk = ByteArray(64 * 1024)
-            var total = 0L
-            while (true) {
-                val read = input.read(chunk)
-                if (read < 0) break
-                total += read
-                if (total > limit) throw TooLarge(total, limit)
-                buffer.write(chunk, 0, read)
-            }
-            buffer.toByteArray()
-        }
-
+        val size = queryLength(resolver, uri) ?: measureLength(context, uri)
+            ?: throw Unreadable("could not determine the size of that file")
+        if (size <= 0) throw Unreadable("that file is empty")
+        if (size > limit) throw TooLarge(size, limit)
         val mime = resolver.getType(uri)
             ?: guessMimeFromName(name)
             ?: "application/octet-stream"
-        return PickedFile(uri, name, mime, bytes)
+        return PickedFile(uri, name, mime, size)
     }
+
+    private fun measureLength(context: Context, uri: Uri): Long? =
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                var total = 0L
+                val buffer = ByteArray(256 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    total += read
+                }
+                total
+            }
+        }.getOrNull()
 
     fun write(context: Context, uri: Uri, bytes: ByteArray) {
         context.contentResolver.openOutputStream(uri, "wt").use { output ->
             requireNotNull(output) { "cannot write to $uri" }
             output.write(bytes)
+            output.flush()
+        }
+    }
+
+    /** Streams a local file to a destination the user picked, for transfers too big to hold. */
+    fun copyTo(context: Context, source: java.io.File, target: Uri) {
+        context.contentResolver.openOutputStream(target, "wt").use { output ->
+            requireNotNull(output) { "cannot write to $target" }
+            source.inputStream().use { input -> input.copyTo(output, 256 * 1024) }
             output.flush()
         }
     }
@@ -100,5 +114,9 @@ fun formatBytes(bytes: Long): String = when {
 fun formatDuration(seconds: Double): String {
     if (!seconds.isFinite() || seconds < 0) return "-"
     val total = seconds.toInt()
-    return if (total < 60) "${total}s" else "${total / 60}m ${total % 60}s"
+    return when {
+        total < 60 -> "${total}s"
+        total < 3600 -> "${total / 60}m ${total % 60}s"
+        else -> "${total / 3600}h ${(total % 3600) / 60}m"
+    }
 }

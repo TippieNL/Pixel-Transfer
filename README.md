@@ -33,6 +33,42 @@ are missed, torn or misread are simply discarded; the stream keeps running.
 *rateless*: the sender can generate an unbounded number of distinct frames from one file, and the
 receiver needs any sufficiently large subset of them, in any order, with any gaps.
 
+### Large transfers
+
+Files up to **150 MB** are supported, but the limit that matters is not the file size - it is the
+link. A screen-to-camera channel carries about 48 KB/s at the defaults, so 150 MB is a transfer
+measured in tens of minutes, not seconds. That is physics, not an implementation detail.
+
+| Palette | Grid | fps | Per frame | 150 MB |
+|---|---|---|---|---|
+| Balanced | 96 | 12 | 4 KB | 84 min |
+| Balanced | 96 | 20 | 4 KB | 50 min |
+| Balanced | 128 | 20 | 8 KB | 25 min |
+| Dense | 128 | 20 | 16 KB | 13 min |
+
+The faster rows need a correspondingly better capture: denser palettes and finer grids both shrink
+the margin the receiver has to work with. A transfer that completes slowly beats one that never
+completes, so the defaults stay conservative.
+
+Anything beyond a couple of megabytes cannot be one fountain-coded object. Both ends have to hold
+every source block, and the block count would overflow the two bytes the frame header stores it in.
+Large files are therefore cut into independently coded **segments** of 2 MB, and:
+
+* the sender streams the file - it reads only the segment it is currently showing, and never holds
+  the whole thing. Preparation makes one streaming pass to compute the SHA-256.
+* the sender cycles through segments, giving each one enough frames to cover the fountain overhead
+  plus a margin (1.5x by default) for the frames the receiver will miss. With no back channel it
+  cannot know when a segment has landed, so it gives every segment its turn and comes back round.
+* the receiver writes each completed segment straight to disk and keeps only a bounded number of
+  partially-decoded segments in memory. Evicting the least recently seen costs one more pass at
+  worst; keeping them all would need as much memory as the file.
+* compression is applied only when the whole payload fits in memory (8 MB). Above that the payload
+  is sent raw, which costs nothing in practice: files that large are photos and videos whose bytes
+  are already entropy-coded.
+
+SHA-256 is still the only gate that reports success, and it is computed by streaming over the
+received file rather than by assembling it in memory.
+
 ### Coding pipeline
 
 Layered, in this order:
@@ -282,6 +318,8 @@ app/                                   Android app (Compose, CameraX)
   already compressed. Deflate is used, and auto-skipped by measurement when it does not help.
 * **Night mode cannot be turned off programmatically.** The app detects and warns instead of
   pretending.
+* **Export is offered for single-segment transfers only.** A 150 MB transfer is around 60,000
+  frames per pass; exporting it would produce a file orders of magnitude larger than the original.
 * **Video export is a compromise** and is treated as one: H.264 is pinned to an all-keyframe, very
   high bitrate configuration, and refused outright for Dense. Lossless PNG or WebP sequences are the
   safe export. A **single still PNG** is offered only when the file genuinely fits in one frame in

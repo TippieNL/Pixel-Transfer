@@ -183,7 +183,17 @@ fun ReceiverScreen(viewModel: ReceiverViewModel, onBack: () -> Unit) {
                 )
 
                 ReceiverPhase.RECEIVING -> Text(
-                    "Receiving",
+                    if (state.isSegmented) {
+                        "Receiving segment ${state.currentSegment + 1} of ${state.segmentCount}"
+                    } else {
+                        "Receiving"
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+
+                ReceiverPhase.VERIFYING -> Text(
+                    "Every segment received - verifying SHA-256",
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.primary,
                 )
@@ -202,25 +212,38 @@ fun ReceiverScreen(viewModel: ReceiverViewModel, onBack: () -> Unit) {
                 )
             }
 
+            if (state.insufficientSpace) {
+                Banner(
+                    "Not enough free space for this file. Free some up before continuing, or the " +
+                        "transfer will fail near the end.",
+                    BannerTone.ERROR,
+                )
+            }
             state.metadata?.let { meta ->
                 StatRow("File", meta.fileName)
                 StatRow("Type", meta.mimeType)
                 StatRow("Size", formatBytes(meta.originalSize.toLong()))
             }
 
-            if (state.phase == ReceiverPhase.RECEIVING || state.phase == ReceiverPhase.COMPLETE) {
+            if (state.phase == ReceiverPhase.RECEIVING ||
+                state.phase == ReceiverPhase.VERIFYING ||
+                state.phase == ReceiverPhase.COMPLETE
+            ) {
                 LinearProgressIndicator(
-                    progress = { state.blockProgress },
+                    progress = { state.overallProgress },
                     modifier = Modifier.fillMaxWidth(),
                 )
                 StatRow(
-                    "Symbols",
-                    "${state.symbolsUnique} / ${state.symbolsNeeded} unique",
+                    "Overall",
+                    "${"%.1f".format(state.overallProgress * 100)}%",
                     emphasis = true,
                 )
+                if (state.isSegmented) {
+                    StatRow("Segments", "${state.segmentsComplete} / ${state.segmentCount} complete")
+                }
                 StatRow(
-                    "Source blocks",
-                    "${state.blocksRecovered} / ${state.sourceBlocks} " +
+                    "This segment",
+                    "${state.blocksRecovered} / ${state.sourceBlocks} blocks " +
                         "(${"%.0f".format(state.blockProgress * 100)}%)",
                 )
                 state.estimatedSecondsRemaining?.let {

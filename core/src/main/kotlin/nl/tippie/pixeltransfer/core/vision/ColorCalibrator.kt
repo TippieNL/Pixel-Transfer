@@ -134,19 +134,24 @@ object ColorCalibrator {
                 byCode.getOrPut(CalibrationRamp.codeOf(p)) { ArrayList() }.add(corrected[p][ch])
             }
             val codes = byCode.keys.sorted()
-            val xs = DoubleArray(codes.size)
-            val ys = DoubleArray(codes.size)
-            for (i in codes.indices) {
-                xs[i] = byCode[codes[i]]!!.average()
-                ys[i] = codes[i].toDouble()
+            // Keep only anchors that are genuinely separated. When the sensor clips, the top
+            // ramp levels all come back as the same near-white value; treating them as distinct
+            // points would bend the curve into nonsense, and throwing the whole curve away for
+            // being non-monotone loses the levels that *are* still resolvable. Dropping the
+            // collapsed anchors and extrapolating past them keeps the usable part.
+            val keptX = ArrayList<Double>(codes.size)
+            val keptY = ArrayList<Double>(codes.size)
+            for (code in codes) {
+                val x = byCode[code]!!.average()
+                if (keptX.isEmpty() || x > keptX[keptX.size - 1] + MIN_ANCHOR_SEPARATION) {
+                    keptX.add(x)
+                    keptY.add(code.toDouble())
+                }
             }
-            var monotone = xs.size >= 2
-            for (i in 1 until xs.size) if (xs[i] <= xs[i - 1] + 1e-6) monotone = false
-            if (monotone) {
-                curveX[ch] = xs
-                curveY[ch] = ys
+            if (keptX.size >= 2) {
+                curveX[ch] = keptX.toDoubleArray()
+                curveY[ch] = keptY.toDoubleArray()
             } else {
-                // A non-monotone response means the fit is unusable; keep the linear map.
                 curveX[ch] = doubleArrayOf(0.0, 255.0)
                 curveY[ch] = doubleArrayOf(0.0, 255.0)
             }
@@ -316,6 +321,12 @@ object ColorCalibrator {
      * along two edges, so an unconstrained plane extrapolates badly into the opposite corner.
      */
     private const val SLOPE_RIDGE = 0.05
+
+    /**
+     * Two calibration anchors closer together than this in measured code units are treated as
+     * one: the sensor is no longer distinguishing them.
+     */
+    private const val MIN_ANCHOR_SEPARATION = 4.0
 
     /** Rejects a plane whose value leaves [lo]..[hi] anywhere in the unit square. */
     private fun clampPlane(p: DoubleArray, lo: Double, hi: Double): DoubleArray? {

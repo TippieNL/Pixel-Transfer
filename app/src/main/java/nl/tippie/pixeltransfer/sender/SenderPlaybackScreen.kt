@@ -96,7 +96,7 @@ fun SenderPlaybackScreen(viewModel: SenderViewModel, onExit: () -> Unit) {
     // Rebuild the pipeline whenever the coding or the rendering changes. fps is deliberately not
     // a key: changing the frame rate must not restart the stream.
     val renderer = remember(transfer, state.config.cellSizePx, state.config.gridCells) {
-        FrameBitmapRenderer(StreamEncoder(transfer), state.config)
+        FrameBitmapRenderer(StreamEncoder(transfer, state.config.cellSizePx), state.config)
     }
     val producer = remember(renderer) { FrameProducer(renderer, scope) }
 

@@ -15,6 +15,8 @@ import kotlinx.coroutines.withContext
 import nl.tippie.pixeltransfer.core.codec.FileMetadata
 import nl.tippie.pixeltransfer.core.pipeline.FailureReason
 import nl.tippie.pixeltransfer.core.pipeline.StreamDecoder
+import nl.tippie.pixeltransfer.core.vision.ExposureGovernor
+import nl.tippie.pixeltransfer.core.vision.ExposureMeter
 import nl.tippie.pixeltransfer.core.vision.FrameDiagnostics
 import nl.tippie.pixeltransfer.core.vision.FrameReader
 import nl.tippie.pixeltransfer.core.vision.Guidance
@@ -48,6 +50,10 @@ data class ReceiverUiState(
     /** Width / height of the upright analysis image, so the overlay can match FIT_CENTER. */
     val overlayAspect: Float = 0f,
     val sha256Verified: Boolean = false,
+    /** Applied exposure compensation index, shown so a stuck loop is visible rather than silent. */
+    val exposureIndex: Int = 0,
+    val exposureSettled: Boolean = false,
+    val clippedFraction: Double = 0.0,
     val failure: FailureReason? = null,
     val savedTo: String? = null,
     val error: String? = null,
@@ -85,6 +91,21 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
     private val decoder = StreamDecoder()
     private val decoding = AtomicBoolean(false)
 
+    private var governor: ExposureGovernor? = null
+    private var consecutiveGood = 0
+    private var framesSinceRemeter = 0
+
+    /** Wired by the screen to the camera; the view model owns the control law, not the camera. */
+    var onExposureRequest: ((Int) -> Unit)? = null
+
+    /** Wired by the screen; asks for a fresh focus and metering pass. */
+    var onRemeterRequest: (() -> Unit)? = null
+
+    /** Called once the camera reports what exposure compensation it supports. */
+    fun attachCamera(exposureRange: IntRange) {
+        governor = ExposureGovernor(exposureRange.first, exposureRange.last)
+    }
+
     /** Timestamps of recently decoded frames, for the effective rate readout. */
     private val recentGood = ArrayDeque<Long>()
     private var recentAttempts = 0
@@ -92,7 +113,11 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
     private val _state = MutableStateFlow(ReceiverUiState())
     val state: StateFlow<ReceiverUiState> = _state.asStateFlow()
 
-    /** Set once a frame has decoded, so the camera can lock exposure exactly then. */
+    /**
+     * Set once several frames in a row have decoded *and* the exposure loop has settled, so the
+     * camera locks a known-good state rather than whatever happened to be in effect at the first
+     * fluke success.
+     */
     @Volatile
     var readyToLock: Boolean = false
         private set
@@ -111,6 +136,15 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
             val width = proxy.width
             val height = proxy.height
             val image = converter.convert(proxy)
+
+            // Exposure is judged on every frame, decoded or not. A blown-out capture cannot
+            // decode, so waiting for a successful decode before correcting exposure would never
+            // correct anything.
+            val exposure = ExposureMeter.measure(image)
+            governor?.let { active ->
+                active.update(exposure)?.let { index -> onExposureRequest?.invoke(index) }
+            }
+
             val result = reader.read(image)
             recentAttempts++
 
@@ -133,7 +167,10 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
             var gained = false
             if (result.isUsable) {
                 gained = decoder.accept(result.header!!, result.symbols)
-                readyToLock = true
+                consecutiveGood++
+                framesSinceRemeter = 0
+                readyToLock = consecutiveGood >= GOOD_FRAMES_BEFORE_LOCK &&
+                    (governor?.isSettled ?: true)
                 val now = System.nanoTime()
                 recentGood.addLast(now)
                 while (recentGood.isNotEmpty() && now - recentGood.first() > RATE_WINDOW_NANOS) {
@@ -141,7 +178,18 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
                 }
             }
 
-            publish(result.status, result.diagnostics, overlay, aspect, gained)
+            if (!result.isUsable) {
+                consecutiveGood = 0
+                framesSinceRemeter++
+                // Nothing is decoding and nothing is improving: nudge focus and metering again
+                // rather than staring at a blurred frame indefinitely.
+                if (framesSinceRemeter >= REMETER_INTERVAL_FRAMES) {
+                    framesSinceRemeter = 0
+                    onRemeterRequest?.invoke()
+                }
+            }
+
+            publish(result.status, result.diagnostics, overlay, aspect, exposure, gained)
         } catch (e: Throwable) {
             _state.update { it.copy(error = e.message) }
         } finally {
@@ -155,6 +203,7 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
         diagnostics: FrameDiagnostics,
         overlay: FloatArray?,
         aspect: Float,
+        exposure: ExposureMeter.Reading,
         gained: Boolean,
     ) {
         val rate = if (recentGood.size < 2) {
@@ -192,6 +241,9 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
                 overlay = overlay ?: previous.overlay.takeIf { status != ReadStatus.NO_FINDERS },
                 overlayAspect = aspect,
                 sha256Verified = result?.sha256Verified ?: false,
+                exposureIndex = governor?.index ?: 0,
+                exposureSettled = governor?.isSettled ?: false,
+                clippedFraction = exposure.clippedFraction,
                 failure = decoder.failure,
             )
         }
@@ -201,7 +253,10 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
         decoder.reset()
         recentGood.clear()
         recentAttempts = 0
+        consecutiveGood = 0
+        framesSinceRemeter = 0
         readyToLock = false
+        governor?.reset()
         _state.value = ReceiverUiState()
     }
 
@@ -227,5 +282,11 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
 
     private companion object {
         const val RATE_WINDOW_NANOS = 3_000_000_000L
+
+        /** Successive good frames required before the camera's settings are frozen. */
+        const val GOOD_FRAMES_BEFORE_LOCK = 3
+
+        /** Frames of failure before asking the camera to refocus and re-meter. */
+        const val REMETER_INTERVAL_FRAMES = 45
     }
 }

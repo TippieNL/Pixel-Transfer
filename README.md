@@ -153,9 +153,43 @@ ever produced a corrupted symbol.
    badly into the opposite corner.
 8. Cell sampling by voting: a 3×3 grid inside the middle half of each cell, per-channel median.
 9. Reed–Solomon, then CRC32 per symbol; failures are discarded.
-10. Frames whose stream id does not match, or whose tear parity is inconsistent, are rejected.
-11. Symbols feed the fountain decoder; on completion the object is decompressed and the SHA-256 is
+11. Frames whose stream id does not match, or whose tear parity is inconsistent, are rejected.
+12. Symbols feed the fountain decoder; on completion the object is decompressed and the SHA-256 is
     verified.
+
+### Sampling and blur
+
+Two things dominate whether a real hand-held capture decodes, and both were found by photographing
+an actual transfer rather than by simulation.
+
+**Where the sub-samples sit.** Sampling across the middle *half* of a cell sounds conservative, but
+under the blur a hand-held phone actually produces those outer samples are reading the neighbouring
+cell. Pulling the cluster in to +/-14% of the cell width cut the cell error rate at blur sigma 1.6
+from 27% to 3.8% on its own.
+
+**Inverting the blur.** The two timing strips are a known alternating pattern at exactly one cell
+per period, so the contrast they come back with *is* the optical system's response at the cell
+frequency - a direct, per-frame, per-axis measurement of how much each cell has been contaminated
+by its neighbours. A symmetric three-tap kernel reproduces an alternating pattern at `2c - 1`, so
+that measurement fixes the kernel exactly, with nothing to guess and no tunable sharpening amount.
+A couple of Van Cittert iterations then undo it: at blur sigma 2.0 the cell error rate falls from
+27.3% to 2.0%, and at sigma 2.5 from 62.6% to 7.2%.
+
+### Exposure
+
+A phone's auto-exposure meters the whole scene. Pointed at a bright display in a dim room it
+exposes for the room and drives the display well past saturation. That collapses the top palette
+levels into each other - Balanced loses two of its four levels per channel - and *nothing* decodes,
+no matter how close, how steady or how sharp the capture is. It is the single failure mode most
+likely to make the app look broken, because every instinct says to move closer and moving closer
+does not help.
+
+So the receiver measures exposure on every frame whether or not anything decoded (waiting for a
+successful decode would be circular) and drives the camera's exposure compensation until the bright
+region sits just below clipping. The statistics are taken over the bright part of the image only: a
+small brilliant rectangle on a dark background says nothing useful about a whole-frame average.
+Auto-exposure and white balance are locked only after several consecutive good frames *and* once
+the loop has settled, because a locked bad exposure cannot recover on its own.
 
 **SHA-256 is the only gate that reports success.** A reported success always means the bytes match
 what the sender hashed. A mismatch is reported as a failure and the data is discarded.
@@ -166,32 +200,35 @@ what the sender hashed. A mismatch is reported as a failure and the data is disc
 
 From `AcceptanceTest`, which runs complete transfers through a simulated camera modelling
 perspective, optical blur, sensor noise, display gamma, camera white balance and channel cross-talk,
-vignetting, glare hotspots, PWM banding, rolling-shutter tearing and 4:2:0 chroma subsampling:
+vignetting, glare hotspots, PWM banding, rolling-shutter tearing, sensor clipping and 4:2:0 chroma
+subsampling:
 
 | Criterion | Result |
 |---|---|
-| 256 KB, Balanced, indoor conditions | **7.7 s** of display time at 12 fps (spec: under 45 s) |
-| 35° off-axis, Robust mode | Transfers; 13 of 13 captures decoded |
+| 256 KB, Balanced, indoor conditions | **5.4 s** of display time at 12 fps (spec: under 45 s) |
+| 35 degrees off-axis, Robust mode | Transfers; 13 of 13 captures decoded |
 | Receiver starts at an arbitrary point in the loop | Transfers |
-| Fountain reception overhead | 0.8–1.5% (spec: ≤ 5%) |
+| Fountain reception overhead | 0.8-1.5% (spec: <= 5%) |
 | Erasure tolerance | Completes with 95% of frames dropped |
 | Torn captures | 30-position sweep: no corrupted symbol ever accepted |
 | Random / unrelated images | Never produce a file |
+| Over-exposed capture | Undecodable at first frame; exposure loop converges in 8 frames |
 
-Single-frame decode envelope, by palette mode, at 1080p capture:
+Single-frame decode envelope, at 1080p capture. "Fill" is the fraction of the frame height the code
+occupies; "clip" is sensor gain above saturation, which the exposure loop now prevents reaching.
 
-| Mode | Smallest capture | Max blur (σ px) | Max off-axis | Glare |
+| Mode | Smallest fill | Max blur (sigma px) | Max off-axis | Survives clipping to |
 |---|---|---|---|---|
-| Robust | code fills 35% of frame | 3.0 | 40° | heavy |
-| Balanced | 60% | 1.5 | 30° | moderate |
-| Grayscale 4 | 60% | 1.5 | 40° | moderate |
-| Dense | 85%, head-on | 0.8 | — | none |
+| Robust | 0.35 | 3.0 | 40 deg | 1.9x |
+| Balanced | 0.45 | 2.5 | 40 deg | 1.2x |
+| Dense | 0.60 | under 1.0 | head-on | none |
 
-Dense is exactly as fragile as the specification predicts: at 16 levels per channel, adjacent
-levels are 17 code values apart, which does not survive half-resolution chroma. It is offered for
-two good phones in controlled light at short range, and refused for video export.
+For comparison, the first build that was tried on real hardware managed fill 0.60, blur 1.5 and 30
+degrees in Balanced, and failed outright on any clipped capture.
 
----
+Dense remains as fragile as the specification predicts: at 16 levels per channel, adjacent levels
+are 17 code values apart, which does not survive half-resolution chroma. It is offered for two good
+phones in controlled light at short range, and refused for video export.
 
 ## Hardware pitfalls, and what is done about them
 
@@ -250,5 +287,10 @@ app/                                   Android app (Compose, CameraX)
   safe export. A **single still PNG** is offered only when the file genuinely fits in one frame in
   Robust mode — symbols below `K` are systematic, so frame 0 alone carries every source block.
 * **The performance figures come from a simulated optical channel**, not from two phones on a desk.
-  The simulation models the impairments the specification names and is deliberately unkind, but it
-  is a model. Real-device numbers will differ.
+  The simulation models the impairments the specification names and is deliberately unkind, and it
+  has now been calibrated against one real failing capture - the exposure, blur and framing in the
+  `FieldConditionsTest` scenario are taken from it. It is still a model. Real-device numbers will
+  differ.
+* **The sender fills the screen automatically.** Cell size defaults to whatever makes the pattern
+  fill the short edge of the sending display, because how many camera pixels land on a cell is the
+  single biggest lever on whether anything decodes. Choosing a cell size by hand overrides this.

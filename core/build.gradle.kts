@@ -20,4 +20,10 @@ dependencies {
 
 tasks.withType<Test> {
     maxHeapSize = "2g"
+    // Several tests report measured envelopes rather than only asserting; that output is the
+    // point of running them.
+    testLogging {
+        showStandardStreams = true
+        events("passed", "failed", "skipped")
+    }
 }

@@ -32,7 +32,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -110,8 +112,14 @@ fun ReceiverScreen(viewModel: ReceiverViewModel, onBack: () -> Unit) {
     var cameraError by remember { mutableStateOf<String?>(null) }
 
     DisposableEffect(controller) {
+        // The view model owns the exposure control law and the camera owns the hardware; these
+        // two callbacks are the only thing joining them.
+        viewModel.onExposureRequest = { index -> controller.setExposureCompensation(index) }
+        viewModel.onRemeterRequest = { previewView.post { controller.meterCentre(previewView) } }
+
         controller.start(
             previewView,
+            onReady = { viewModel.attachCamera(controller.exposureRange) },
             onFrame = { proxy ->
                 viewModel.onFrame(proxy)
                 if (viewModel.readyToLock && !controller.isLocked) {
@@ -121,13 +129,27 @@ fun ReceiverScreen(viewModel: ReceiverViewModel, onBack: () -> Unit) {
             onError = { cameraError = it.message ?: "camera failed to start" },
         )
         onDispose {
+            viewModel.onExposureRequest = null
+            viewModel.onRemeterRequest = null
             controller.stop()
             executor.shutdown()
         }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        AndroidView(
+            factory = { previewView },
+            modifier = Modifier
+                .fillMaxSize()
+                // Tapping re-runs focus and metering where the user pointed, which is the fastest
+                // way out of a camera that has focused on the wrong thing.
+                .pointerInput(Unit) {
+                    detectTapGestures { offset ->
+                        controller.unlock()
+                        controller.focusAt(previewView, offset.x, offset.y, lock = false)
+                    }
+                },
+        )
 
         state.overlay?.let { corners -> DetectionOverlay(corners, state.overlayAspect) }
 
@@ -221,7 +243,19 @@ fun ReceiverScreen(viewModel: ReceiverViewModel, onBack: () -> Unit) {
             StatRow(
                 "Signal",
                 "cell ${"%.1f".format(state.diagnostics.cellPixelSize)} px · " +
-                    "${"%.0f".format(state.diagnostics.offAxisDegrees)}° off-axis",
+                    "${"%.0f".format(state.diagnostics.offAxisDegrees)}° off-axis · " +
+                    "focus ${"%.0f".format(state.diagnostics.sharpness * 100)}%",
+            )
+            StatRow(
+                "Exposure",
+                "${if (state.exposureIndex > 0) "+" else ""}${state.exposureIndex} · " +
+                    "${"%.0f".format(state.clippedFraction * 100)}% clipped" +
+                    if (state.exposureSettled) " · settled" else " · adjusting",
+            )
+            Text(
+                "Tap the preview to refocus.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
             when (state.phase) {

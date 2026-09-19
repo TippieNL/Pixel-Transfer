@@ -150,7 +150,15 @@ object TransferPreparation {
  * the stream stays rateless: a receiver that starts at an arbitrary point simply collects
  * whatever distinct symbols pass in front of it.
  */
-class StreamEncoder(val transfer: PreparedTransfer) {
+class StreamEncoder(
+    val transfer: PreparedTransfer,
+    /**
+     * Cell size to advertise, which may differ from the prepared transfer's if the sender has
+     * since resized the pattern. Cell size affects only how the frame is drawn, never how it is
+     * coded, so changing it must not force a re-encode and a new stream id.
+     */
+    private val cellSizePx: Int = transfer.config.cellSizePx,
+) {
 
     private val fountain = FountainEncoder(transfer.fountainParams, transfer.encodedObject)
     private val codec = FrameCodec(transfer.plan)
@@ -164,7 +172,7 @@ class StreamEncoder(val transfer: PreparedTransfer) {
         sourceBlocks = transfer.sourceBlocks,
         blockSize = transfer.fountainParams.symbolSize,
         paletteMode = transfer.config.paletteMode,
-        cellSize = transfer.config.cellSizePx,
+        cellSize = cellSizePx,
         eccLevel = transfer.config.eccLevel,
         compression = transfer.metadata.compression,
         frameSequence = sequence,

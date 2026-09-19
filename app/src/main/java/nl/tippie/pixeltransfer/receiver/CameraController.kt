@@ -50,12 +50,21 @@ class CameraController(
     var isLocked: Boolean = false
         private set
 
+    /** Exposure compensation indices the device supports, or 0..0 when it has no control. */
+    var exposureRange: IntRange = 0..0
+        private set
+
     /** Resolution actually granted by the camera, once bound. */
     var analysisSize: Size? = null
         private set
 
     @SuppressLint("UnsafeOptInUsageError")
-    fun start(previewView: PreviewView, onFrame: (ImageProxy) -> Unit, onError: (Throwable) -> Unit) {
+    fun start(
+        previewView: PreviewView,
+        onReady: () -> Unit,
+        onFrame: (ImageProxy) -> Unit,
+        onError: (Throwable) -> Unit,
+    ) {
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener({
             try {
@@ -111,17 +120,62 @@ class CameraController(
                     imageAnalysis,
                 )
                 analysisSize = imageAnalysis.resolutionInfo?.resolution
+                camera?.cameraInfo?.exposureState?.let { exposure ->
+                    exposureRange = if (exposure.isExposureCompensationSupported) {
+                        exposure.exposureCompensationRange.lower..exposure.exposureCompensationRange.upper
+                    } else {
+                        0..0
+                    }
+                }
+                // Meter once on the centre straight away. Left to its own devices the camera
+                // exposes for the dark room around the sending screen and focuses on nothing in
+                // particular; both take several seconds to settle on their own, if they ever do.
+                previewView.post { meterCentre(previewView) }
+                onReady()
             } catch (e: Throwable) {
                 onError(e)
             }
         }, ContextCompat.getMainExecutor(context))
     }
 
+    /** Applies an exposure compensation index, clamped to what the device supports. */
+    fun setExposureCompensation(index: Int) {
+        val active = camera ?: return
+        if (exposureRange.first == 0 && exposureRange.last == 0) return
+        val clamped = index.coerceIn(exposureRange.first, exposureRange.last)
+        runCatching { active.cameraControl.setExposureCompensationIndex(clamped) }
+    }
+
+    /**
+     * Runs a focus, exposure and white-balance metering pass on the centre of the frame.
+     *
+     * Auto-cancel is left enabled so the camera keeps adapting; this is an acquisition nudge,
+     * not a lock.
+     */
+    fun meterCentre(previewView: PreviewView) {
+        focusAt(previewView, previewView.width / 2f, previewView.height / 2f, lock = false)
+    }
+
+    /** Metering triggered by the user tapping the preview. */
+    fun focusAt(previewView: PreviewView, x: Float, y: Float, lock: Boolean) {
+        val active = camera ?: return
+        runCatching {
+            val point = previewView.meteringPointFactory.createPoint(x, y)
+            val builder = FocusMeteringAction.Builder(
+                point,
+                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB,
+            )
+            if (lock) builder.disableAutoCancel()
+            active.cameraControl.startFocusAndMetering(builder.build())
+        }
+    }
+
     /**
      * Locks focus, exposure and white balance on the centre of the frame.
      *
-     * Called once the decoder has read a frame successfully, which is the moment we know the
-     * current settings are good enough - locking earlier risks freezing a bad exposure.
+     * Called only once the decoder has read several frames in a row *and* the exposure loop has
+     * settled. Locking on the first success would freeze whatever exposure happened to be in
+     * effect at that instant, and a locked bad exposure is unrecoverable without user action.
      */
     @SuppressLint("UnsafeOptInUsageError")
     fun lockForDecoding(previewView: PreviewView) {
@@ -129,14 +183,7 @@ class CameraController(
         if (isLocked) return
         isLocked = true
 
-        runCatching {
-            val factory = previewView.meteringPointFactory
-            val point = factory.createPoint(previewView.width / 2f, previewView.height / 2f)
-            val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
-                .disableAutoCancel()
-                .build()
-            active.cameraControl.startFocusAndMetering(action)
-        }
+        focusAt(previewView, previewView.width / 2f, previewView.height / 2f, lock = true)
 
         runCatching {
             Camera2CameraControl.from(active.cameraControl).setCaptureRequestOptions(

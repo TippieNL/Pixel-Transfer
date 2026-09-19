@@ -39,6 +39,13 @@ class OpticalChannel(
     val glareStrength: Double = 0.0,
     val glareX: Double = 0.7,
     val glareY: Double = 0.3,
+    /**
+     * Sensor gain before clipping. A phone metering a dark room and then pointed at an emissive
+     * display drives the screen well past saturation: values above 1.0 clip the bright end, which
+     * is what turns the palette into washed-out pastels and collapses the top calibration levels
+     * into each other.
+     */
+    val exposureGain: Double = 1.0,
     /** Amplitude of PWM backlight banding, in code units. */
     val pwmBanding: Double = 0.0,
     val pwmPeriodPx: Double = 37.0,
@@ -138,6 +145,11 @@ class OpticalChannel(
                     val d2 = ((x - gx) * (x - gx) + (y - gy) * (y - gy)) / (2 * glareSigma * glareSigma)
                     val add = glareStrength * exp(-d2)
                     r += add; g += add; b += add
+                }
+                if (exposureGain != 1.0) {
+                    r *= exposureGain
+                    g *= exposureGain
+                    b *= exposureGain
                 }
                 if (noiseSigma > 0.0) {
                     r += gaussian(rng) * noiseSigma

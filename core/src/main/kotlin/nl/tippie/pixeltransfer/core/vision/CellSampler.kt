@@ -12,8 +12,16 @@ object CellSampler {
 
     const val DEFAULT_SUBSAMPLES = 3
 
-    /** Fraction of the cell width skipped at each edge. */
-    private const val INSET = 0.25
+    /**
+     * How far from the cell centre the sub-samples spread, as a fraction of the cell width.
+     *
+     * This is a direct trade between two error sources. Spreading wide averages away sensor noise
+     * and tolerates a slightly misaligned grid; spreading narrow keeps the samples away from the
+     * neighbouring cells, whose colour blur drags across the boundary. Under the optical blur a
+     * hand-held phone actually produces, neighbour bleed dominates by a wide margin, so the
+     * samples sit well inside the middle half.
+     */
+    const val DEFAULT_INSET = 0.14
 
     private const val MAX_SUBSAMPLES = 8
 
@@ -33,15 +41,16 @@ object CellSampler {
         cellY: Int,
         subsamples: Int = DEFAULT_SUBSAMPLES,
         out: IntArray,
+        inset: Double = DEFAULT_INSET,
     ) {
         val s = scratch.get()
         val n = subsamples.coerceIn(1, MAX_SUBSAMPLES)
         val total = n * n
         var i = 0
         for (sy in 0 until n) {
-            val fy = cellY + 0.5 + offset(sy, n)
+            val fy = cellY + 0.5 + offset(sy, n, inset)
             for (sx in 0 until n) {
-                val fx = cellX + 0.5 + offset(sx, n)
+                val fx = cellX + 0.5 + offset(sx, n, inset)
                 val x = fit.pixelX(fx, fy).toInt().coerceIn(0, image.width - 1)
                 val y = fit.pixelY(fx, fy).toInt().coerceIn(0, image.height - 1)
                 val rgb = image.rgbAt(x, y)
@@ -68,8 +77,8 @@ object CellSampler {
         return (out[0] * 77 + out[1] * 151 + out[2] * 28) shr 8
     }
 
-    private fun offset(index: Int, n: Int): Double =
-        if (n == 1) 0.0 else -INSET + 2.0 * INSET * index / (n - 1)
+    private fun offset(index: Int, n: Int, inset: Double): Double =
+        if (n == 1) 0.0 else -inset + 2.0 * inset * index / (n - 1)
 
     private fun median(values: IntArray, count: Int): Int {
         // Insertion sort: count is at most 64 and usually 9.

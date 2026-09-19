@@ -40,6 +40,9 @@ data class SenderUiState(
 
 class SenderViewModel(application: Application) : AndroidViewModel(application) {
 
+    private var cellSizeChosenByUser = false
+    private var screenPx = 0
+
     private val _state = MutableStateFlow(SenderUiState())
     val state: StateFlow<SenderUiState> = _state.asStateFlow()
 
@@ -76,9 +79,54 @@ class SenderViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setEccLevel(level: EccLevel) = reconfigure { it.copy(eccLevel = level) }
 
-    fun setCellSize(px: Int) = reconfigure { it.copy(cellSizePx = px) }
+    /**
+     * Cell size is the one modulation setting that does not change the coding at all - it only
+     * changes how large each cell is drawn - so it neither re-encodes nor invalidates a receiver
+     * that is part-way through.
+     */
+    fun setCellSize(px: Int) {
+        cellSizeChosenByUser = true
+        _state.update {
+            it.copy(
+                config = it.config.copy(
+                    cellSizePx = px.coerceIn(SenderConfig.MIN_CELL_SIZE, SenderConfig.MAX_CELL_SIZE),
+                ),
+            )
+        }
+    }
 
-    fun setGrid(cells: Int) = reconfigure { it.copy(gridCells = cells) }
+    /**
+     * Grows the pattern to fill the sending screen.
+     *
+     * The single biggest lever on whether the receiver can read anything is how many camera
+     * pixels land on each cell, and the default 8 px cell leaves roughly a quarter of a 1080 px
+     * wide phone unused. Filling the screen is free range and free tolerance to blur, so it is
+     * done automatically - until the user picks a size themselves, at which point their choice
+     * stands.
+     */
+    fun fitCellSizeToScreen(availablePx: Int) {
+        if (availablePx <= 0) return
+        screenPx = availablePx
+        if (cellSizeChosenByUser) return
+        val config = _state.value.config
+        val best = (availablePx / (config.gridCells + 2 * SenderConfig.QUIET_CELLS))
+            .coerceIn(SenderConfig.MIN_CELL_SIZE, SenderConfig.MAX_CELL_SIZE)
+        if (best == config.cellSizePx) return
+        _state.update { it.copy(config = it.config.copy(cellSizePx = best)) }
+    }
+
+    fun setGrid(cells: Int) {
+        reconfigure { it.copy(gridCells = cells) }
+        // A different grid wants a different cell size to keep filling the screen.
+        if (!cellSizeChosenByUser) {
+            val config = _state.value.config
+            val best = (screenPx / (config.gridCells + 2 * SenderConfig.QUIET_CELLS))
+                .coerceIn(SenderConfig.MIN_CELL_SIZE, SenderConfig.MAX_CELL_SIZE)
+            if (screenPx > 0 && best != config.cellSizePx) {
+                _state.update { it.copy(config = it.config.copy(cellSizePx = best)) }
+            }
+        }
+    }
 
     fun setMaxFileSize(bytes: Int) = reconfigure { it.copy(maxFileSizeBytes = bytes) }
 

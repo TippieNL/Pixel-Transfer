@@ -16,8 +16,6 @@ object Guidance {
     /** Cells smaller than this in the capture cannot be classified reliably. */
     private const val MIN_CELL_PIXELS = 2.2
 
-    /** Beyond this the cell grid is being oversampled and the user could back off. */
-    private const val COMFORTABLE_CELL_PIXELS = 3.0
 
     fun hints(
         status: ReadStatus,
@@ -29,7 +27,12 @@ object Guidance {
 
         when (status) {
             ReadStatus.NO_FINDERS -> out.add(
-                Hint("Point the camera at the sending screen", Hint.Severity.INFO),
+                if (recentAttempts > 15 && recentGoodFrames == 0) {
+                    // The user is plainly already pointing at it, so say something useful.
+                    Hint("Move closer so the pattern fills the frame", Hint.Severity.WARN)
+                } else {
+                    Hint("Point the camera at the sending screen", Hint.Severity.INFO)
+                },
             )
             ReadStatus.NO_GRID -> out.add(
                 Hint("Fit the whole pattern in view", Hint.Severity.WARN),
@@ -46,14 +49,22 @@ object Guidance {
             ReadStatus.OK -> Unit
         }
 
+        if (diagnostics.clippedFraction > 0.10 && diagnostics.glareImbalance < 0.08) {
+            // Clipping spread evenly over the frame is the camera over-exposing an emissive
+            // display, which collapses the top palette levels into each other.
+            out.add(Hint("Too bright - the camera is clipping", Hint.Severity.WARN))
+        } else if (diagnostics.glareImbalance > 0.08) {
+            out.add(Hint("Glare - tilt slightly to move the reflection", Hint.Severity.WARN))
+        }
+
         if (status != ReadStatus.NO_FINDERS) {
             if (diagnostics.cellPixelSize in 0.01..MIN_CELL_PIXELS) {
                 out.add(Hint("Move closer", Hint.Severity.WARN))
-            } else if (diagnostics.cellPixelSize > 12.0) {
+            } else if (diagnostics.cellPixelSize > 16.0) {
                 out.add(Hint("Move back a little", Hint.Severity.INFO))
             }
-            if (diagnostics.glareFraction > 0.08) {
-                out.add(Hint("Glare detected - change the angle slightly", Hint.Severity.WARN))
+            if (diagnostics.sharpness in 0.01..0.45) {
+                out.add(Hint("Out of focus - hold steady, or tap to refocus", Hint.Severity.WARN))
             }
             if (diagnostics.contrast in 0.01..45.0) {
                 out.add(Hint("Too dark - raise the sender's brightness", Hint.Severity.WARN))
@@ -61,8 +72,8 @@ object Guidance {
             if (diagnostics.offAxisDegrees > 35.0) {
                 out.add(Hint("Reduce angle - hold the phones more parallel", Hint.Severity.WARN))
             }
-            if (diagnostics.sharpness in 0.01..0.25 && diagnostics.cellPixelSize > COMFORTABLE_CELL_PIXELS) {
-                out.add(Hint("Blurred - hold steady while focus settles", Hint.Severity.WARN))
+            if (diagnostics.tornRowFraction > 0.0) {
+                out.add(Hint("Hold steady - frames are tearing", Hint.Severity.WARN))
             }
             if (diagnostics.rsBlocksTotal > 0 &&
                 diagnostics.rsBlocksFailed > diagnostics.rsBlocksTotal / 3

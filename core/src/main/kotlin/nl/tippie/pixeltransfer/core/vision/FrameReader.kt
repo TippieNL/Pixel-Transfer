@@ -8,7 +8,6 @@ import nl.tippie.pixeltransfer.core.frame.FramePlan
 import nl.tippie.pixeltransfer.core.frame.Palette
 import nl.tippie.pixeltransfer.core.frame.PaletteMode
 import nl.tippie.pixeltransfer.core.frame.SymbolPacket
-import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.hypot
 
@@ -26,7 +25,7 @@ enum class ReadStatus {
     /** The header did not survive its Reed-Solomon code. */
     HEADER_FAILED,
 
-    /** The capture straddles two displayed frames. */
+    /** The capture straddles two displayed frames badly enough not to be worth decoding. */
     TORN,
 
     /** The frame decoded but every symbol failed its CRC. */
@@ -43,9 +42,14 @@ data class FrameDiagnostics(
     /** Approximate off-axis angle in degrees, from the foreshortening of the code area. */
     val offAxisDegrees: Double = 0.0,
     val cellPixelSize: Double = 0.0,
-    /** Fraction of sampled cells that are blown out to white. */
-    val glareFraction: Double = 0.0,
-    /** Adjacent-timing-cell modulation relative to full contrast; low means blurred. */
+    /** Fraction of cells the sensor clipped to white. Drives the exposure loop. */
+    val clippedFraction: Double = 0.0,
+    /**
+     * How unevenly the clipping is spread. Clipping everywhere is over-exposure; clipping in one
+     * corner is a specular reflection, and the two need opposite advice.
+     */
+    val glareImbalance: Double = 0.0,
+    /** Contrast retained by the alternating timing strip, 0..1. Low means blurred. */
     val sharpness: Double = 0.0,
     val tornRowFraction: Double = 0.0,
     val rsBlocksTotal: Int = 0,
@@ -63,7 +67,7 @@ class FrameReadResult(
     /** Detected code corners in image space, for the preview overlay. */
     val corners: Array<DoubleArray>? = null,
 ) {
-    val isUsable: Boolean get() = status == ReadStatus.OK && symbols.isNotEmpty()
+    val isUsable: Boolean get() = symbols.isNotEmpty()
 }
 
 /**
@@ -77,8 +81,6 @@ class FrameReadResult(
  */
 class FrameReader(
     private val candidateGrids: IntArray = GridFitter.CANDIDATE_GRIDS,
-    /** Fraction of tear-stripe rows that may disagree before the frame is discarded. */
-    private val tearTolerance: Double = 0.04,
 ) {
 
     private var binarizer: Binarizer? = null
@@ -86,7 +88,7 @@ class FrameReader(
     private var lastWidth = -1
     private var lastHeight = -1
 
-    /** Caches the grid fit; layouts are rebuilt only when the grid size actually changes. */
+    /** Caches the layout; it is rebuilt only when the grid size actually changes. */
     private var cachedLayout: FrameLayout? = null
 
     fun read(image: CameraImage): FrameReadResult {
@@ -120,25 +122,30 @@ class FrameReader(
         val calibration = ColorCalibrator.calibrate(image, fit, layout)
             ?: return FrameReadResult(ReadStatus.NO_CALIBRATION, corners = fit.corners)
 
-        val geometry = measureGeometry(image, fit, layout, calibration)
+        // Sample every cell once, measure how much the optics smeared neighbours together, and
+        // undo as much of it as the measurement justifies.
+        val field = CellFieldSampler.sample(image, fit, layout, calibration)
+        val modulationX = CellFieldSampler.modulation(field, layout, horizontal = true)
+        val modulationY = CellFieldSampler.modulation(field, layout, horizontal = false)
+        CellFieldSampler.sharpen(field, modulationX, modulationY)
 
-        // Header: always Robust palette, interleaved across the whole frame.
+        val geometry = measureGeometry(fit, layout, calibration, field, modulationX, modulationY)
+
         val headerCells = FrameCodec.headerCellCount()
         if (layout.dataCells.size <= headerCells) {
             return FrameReadResult(ReadStatus.NO_GRID, corners = fit.corners, diagnostics = geometry)
         }
-        val rgb = IntArray(3)
-        val corrected = IntArray(3)
         val headerSymbols = IntArray(headerCells) { i ->
-            val cell = layout.dataCells[i]
-            classify(image, fit, layout, calibration, cell, PaletteMode.ROBUST, rgb, corrected)
+            classify(field, layout.dataCells[i], PaletteMode.ROBUST)
         }
         val header = FrameCodec.decodeHeader(layout, headerSymbols)
             ?: return FrameReadResult(ReadStatus.HEADER_FAILED, corners = fit.corners, diagnostics = geometry)
 
-        val tornFraction = tearFraction(image, fit, layout, calibration, header.nonce)
+        val tornFraction = tearFraction(field, layout, header.nonce)
         val diagnostics = geometry.copy(tornRowFraction = tornFraction)
-        if (tornFraction > tearTolerance) {
+        if (tornFraction >= TEAR_ABANDON) {
+            // Most of the capture belongs to a different displayed frame; decoding it would only
+            // burn CPU on symbols whose CRCs cannot pass.
             return FrameReadResult(ReadStatus.TORN, header, emptyList(), diagnostics, fit.corners)
         }
 
@@ -150,8 +157,7 @@ class FrameReader(
         }
 
         val payloadSymbols = IntArray(plan.payloadCellCount) { i ->
-            val cell = layout.dataCells[headerCells + i]
-            classify(image, fit, layout, calibration, cell, header.paletteMode, rgb, corrected)
+            classify(field, layout.dataCells[headerCells + i], header.paletteMode)
         }
         val payload = FrameCodec(plan).decodePayload(payloadSymbols)
 
@@ -170,10 +176,24 @@ class FrameReader(
         const val QUAD_HYPOTHESES = 4
 
         /** Shortest run of rows that can be called a tear rather than a noise cluster. */
-        const val MIN_TEAR_ROWS = 4
+        const val MIN_TEAR_ROWS = 6
 
         /** Difference in stripe error rate between the two sides that indicates a real tear. */
-        const val TEAR_SEPARATION = 0.25
+        const val TEAR_SEPARATION = 0.28
+
+        /** The torn side must disagree about this often; a wrong nonce flips half the bits. */
+        const val TEAR_HIGH_RATE = 0.33
+
+        /** ...and the intact side must be this clean, or what looks like a tear is just noise. */
+        const val TEAR_LOW_RATE = 0.15
+
+        /**
+         * Above this much of the frame coming from another displayed frame, decoding is pointless:
+         * measurement shows such frames never yield a symbol whose CRC passes. Below it the frame
+         * is still worth reading - a tear of a few rows is repaired outright by Reed-Solomon, and
+         * throwing away a readable frame costs far more than the attempt.
+         */
+        const val TEAR_ABANDON = 0.12
     }
 
     private fun layoutFor(grid: Int): FrameLayout {
@@ -184,23 +204,8 @@ class FrameReader(
         return layout
     }
 
-    private fun classify(
-        image: CameraImage,
-        fit: GridFit,
-        layout: FrameLayout,
-        calibration: ColorCalibration,
-        cell: Int,
-        mode: PaletteMode,
-        rgb: IntArray,
-        corrected: IntArray,
-    ): Int {
-        val x = layout.xOf(cell)
-        val y = layout.yOf(cell)
-        CellSampler.sampleRgb(image, fit, x, y, CellSampler.DEFAULT_SUBSAMPLES, rgb)
-        val span = (layout.grid - 1).toDouble()
-        calibration.correct(rgb[0], rgb[1], rgb[2], x / span, y / span, corrected)
-        return Palette.symbolFromCodes(mode, corrected[0], corrected[1], corrected[2])
-    }
+    private fun classify(field: CellField, cell: Int, mode: PaletteMode): Int =
+        Palette.symbolFromCodes(mode, field.red[cell], field.green[cell], field.blue[cell])
 
     /**
      * Estimates how much of the capture came from a different displayed frame.
@@ -208,22 +213,11 @@ class FrameReader(
      * A rolling shutter tear is *contiguous*: every row past some scanline carries the next
      * frame's nonce. Misread cells, by contrast, are scattered. So rather than counting
      * disagreements, this looks for the horizontal split that best separates agreeing rows from
-     * disagreeing ones. Uniform noise produces no such split and is correctly not called a tear,
-     * which matters because discarding readable frames is expensive.
-     *
-     * Returns the fraction of stripe rows that belong to the other frame, or 0 when there is no
-     * evidence of a tear.
+     * disagreeing ones - and then insists the split is decisive, because the best of many
+     * candidate splits is biased upwards and a noisy capture will always produce one that looks
+     * suggestive. Calling a readable frame torn is the expensive mistake here.
      */
-    private fun tearFraction(
-        image: CameraImage,
-        fit: GridFit,
-        layout: FrameLayout,
-        calibration: ColorCalibration,
-        nonce: Int,
-    ): Double {
-        val rgb = IntArray(3)
-        val corrected = IntArray(3)
-        val span = (layout.grid - 1).toDouble()
+    private fun tearFraction(field: CellField, layout: FrameLayout, nonce: Int): Double {
         val rowMismatch = ArrayList<Int>(layout.grid)
         var cellsPerRow = 0
 
@@ -231,9 +225,9 @@ class FrameReader(
             var disagreements = 0
             var cells = 0
             for (col in layout.nonceCols) {
-                if (layout.roles[layout.index(col, row)] != CellRole.NONCE_STRIPE) continue
-                CellSampler.sampleRgb(image, fit, col, row, CellSampler.DEFAULT_SUBSAMPLES, rgb)
-                val observed = calibration.isLight(rgb[0], rgb[1], rgb[2], col / span, row / span, corrected)
+                val index = layout.index(col, row)
+                if (layout.roles[index] != CellRole.NONCE_STRIPE) continue
+                val observed = field.luma(index) > 127
                 val expected = FrameHeader.stripeBit(nonce, row, col - layout.nonceCols.first)
                 if (observed != expected) disagreements++
                 cells++
@@ -244,18 +238,22 @@ class FrameReader(
         }
 
         val rows = rowMismatch.size
-        if (rows < MIN_TEAR_ROWS * 2 || cellsPerRow == 0) return 0.0
+        val minSide = maxOf(MIN_TEAR_ROWS, rows / 8)
+        if (rows < minSide * 2 || cellsPerRow == 0) return 0.0
 
         val prefix = IntArray(rows + 1)
         for (i in 0 until rows) prefix[i + 1] = prefix[i] + rowMismatch[i]
 
         var bestFraction = 0.0
         var bestSeparation = 0.0
-        for (split in MIN_TEAR_ROWS..rows - MIN_TEAR_ROWS) {
+        for (split in minSide..rows - minSide) {
             val topRate = prefix[split].toDouble() / (split * cellsPerRow)
             val bottomRate = (prefix[rows] - prefix[split]).toDouble() /
                 ((rows - split) * cellsPerRow)
-            val separation = kotlin.math.abs(topRate - bottomRate)
+            val high = maxOf(topRate, bottomRate)
+            val low = minOf(topRate, bottomRate)
+            if (high < TEAR_HIGH_RATE || low > TEAR_LOW_RATE) continue
+            val separation = high - low
             if (separation > bestSeparation) {
                 bestSeparation = separation
                 bestFraction = if (topRate > bottomRate) {
@@ -265,17 +263,17 @@ class FrameReader(
                 }
             }
         }
-        // A wrong nonce flips each stripe bit with probability one half, so a genuine tear shows
-        // a separation approaching 0.5; scattered misreads stay far below it.
         return if (bestSeparation >= TEAR_SEPARATION) bestFraction else 0.0
     }
 
-    /** Brightness, glare, sharpness and off-axis angle, all from cells we already have to read. */
+    /** Exposure, glare, sharpness and off-axis angle, all from cells already sampled. */
     private fun measureGeometry(
-        image: CameraImage,
         fit: GridFit,
         layout: FrameLayout,
         calibration: ColorCalibration,
+        field: CellField,
+        modulationX: Double,
+        modulationY: Double,
     ): FrameDiagnostics {
         val corners = fit.corners
         val sides = DoubleArray(4)
@@ -290,36 +288,44 @@ class FrameReader(
         val foreshortening = minOf(aspect, 1.0 / aspect).coerceIn(0.05, 1.0)
         val offAxis = Math.toDegrees(acos(foreshortening))
 
-        // Sharpness from the top timing strip: how much of full contrast survives between
-        // adjacent alternating cells.
-        var modulation = 0.0
-        var pairs = 0
-        var previous = -1
-        var blown = 0
-        var sampled = 0
-        var brightnessSum = 0.0
-        for (col in layout.bandStart..layout.bandEnd) {
-            val luma = CellSampler.sampleLuma(image, fit, col, layout.timingRow)
-            brightnessSum += luma
-            sampled++
-            if (luma >= 250) blown++
-            if (previous >= 0) {
-                modulation += abs(luma - previous)
-                pairs++
+        // Exposure is judged on what the sensor delivered, not on the corrected values.
+        val half = layout.grid / 2
+        val quadrantClipped = IntArray(4)
+        val quadrantCells = IntArray(4)
+        var clipped = 0
+        var brightnessSum = 0L
+        for (y in 0 until layout.grid) {
+            for (x in 0 until layout.grid) {
+                val luma = field.rawLuma[layout.index(x, y)]
+                brightnessSum += luma
+                val quadrant = (if (x >= half) 1 else 0) + (if (y >= half) 2 else 0)
+                quadrantCells[quadrant]++
+                if (luma >= CLIPPING_LEVEL) {
+                    clipped++
+                    quadrantClipped[quadrant]++
+                }
             }
-            previous = luma
         }
-        val contrast = calibration.contrast
-        val sharpness = if (pairs == 0 || contrast <= 1.0) 0.0 else (modulation / pairs) / contrast
+        val cells = layout.grid * layout.grid
+        val clippedFraction = clipped.toDouble() / cells
+        var worstQuadrant = 0.0
+        for (q in 0 until 4) {
+            if (quadrantCells[q] == 0) continue
+            worstQuadrant = maxOf(worstQuadrant, quadrantClipped[q].toDouble() / quadrantCells[q])
+        }
 
         return FrameDiagnostics(
-            brightness = if (sampled == 0) 0.0 else brightnessSum / sampled,
-            contrast = contrast,
+            brightness = brightnessSum.toDouble() / cells,
+            contrast = calibration.contrast,
             calibrationResidual = calibration.residual,
             offAxisDegrees = offAxis,
             cellPixelSize = fit.cellPixelSize(),
-            glareFraction = if (sampled == 0) 0.0 else blown.toDouble() / sampled,
-            sharpness = sharpness.coerceIn(0.0, 2.0),
+            clippedFraction = clippedFraction,
+            glareImbalance = (worstQuadrant - clippedFraction).coerceAtLeast(0.0),
+            sharpness = minOf(modulationX, modulationY),
         )
     }
 }
+
+/** Sensor values at or above this are treated as clipped to white. */
+private const val CLIPPING_LEVEL = 248

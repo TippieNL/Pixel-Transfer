@@ -78,7 +78,9 @@ object StreamExporter {
         if (!isSupported(format, transfer.config.paletteMode)) {
             throw UnsupportedForPalette(transfer.config.paletteMode)
         }
-        val renderer = FrameBitmapRenderer(StreamEncoder(transfer), transfer.config)
+        val renderer = FrameBitmapRenderer(
+            StreamEncoder(transfer, transfer.config.cellSizePx), transfer.config,
+        )
         when (format) {
             ExportFormat.PNG_SEQUENCE ->
                 exportZip(context, target, renderer, frameCount, Bitmap.CompressFormat.PNG, "png", onProgress)

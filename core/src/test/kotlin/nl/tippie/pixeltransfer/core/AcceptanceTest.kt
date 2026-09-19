@@ -171,7 +171,12 @@ class AcceptanceTest {
             val second = sender.display(step + 1)
             val result = reader.read(channel.capture(first, sender.size, second, tearAt))
             statuses[result.status] = (statuses[result.status] ?: 0) + 1
-            if (result.status == ReadStatus.TORN) torn++
+            if (result.diagnostics.tornRowFraction > 0.0) torn++
+            println(
+                "  tearAt=${"%.2f".format(tearAt)} ${result.status} " +
+                    "torn=${"%.2f".format(result.diagnostics.tornRowFraction)} " +
+                    "symbols=${result.symbols.size}",
+            )
             // Whatever survives a tear must still be genuinely correct.
             val expected = sender.encoder.symbolsFor(step) + sender.encoder.symbolsFor(step + 1)
             for (packet in result.symbols) {
@@ -185,7 +190,7 @@ class AcceptanceTest {
             }
         }
         println("torn sweep: statuses=$statuses, $accepted symbols accepted and all correct")
-        assertTrue("the tear stripe never fired", torn > 0)
+        assertTrue("the tear stripe never measured a tear", torn > 0)
     }
 
     @Test

@@ -19,6 +19,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -26,6 +27,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import nl.tippie.pixeltransfer.core.frame.EccLevel
 import nl.tippie.pixeltransfer.core.frame.PaletteMode
@@ -40,6 +43,9 @@ import nl.tippie.pixeltransfer.util.formatBytes
 import nl.tippie.pixeltransfer.util.formatDuration
 
 /** Offered file-size caps. The default is 2 MB; above that transfers become tedious. */
+/** Offered grid sizes. Smaller is more robust, larger is faster. */
+private val GRID_SIZES = listOf(64, 80, 96, 128)
+
 private val FILE_SIZE_LIMITS = listOf(
     512 * 1024,
     1024 * 1024,
@@ -55,6 +61,14 @@ fun SenderSetupScreen(
     onBack: () -> Unit,
 ) {
     val state by viewModel.state.collectAsState()
+
+    // Grow the pattern to fill this screen unless the user has chosen a size themselves.
+    val configuration = LocalConfiguration.current
+    val density = LocalDensity.current
+    LaunchedEffect(configuration, state.config.gridCells) {
+        val shortEdgeDp = minOf(configuration.screenWidthDp, configuration.screenHeightDp)
+        viewModel.fitCellSizeToScreen(with(density) { shortEdgeDp.dp.roundToPx() })
+    }
 
     val pickFile = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
@@ -190,6 +204,20 @@ fun SenderSetupScreen(
                 onSelect = viewModel::setEccLevel,
             )
 
+            Text("Grid", style = MaterialTheme.typography.bodyMedium)
+            ChipRow(
+                options = GRID_SIZES,
+                selected = state.config.gridCells,
+                label = { "$it x $it" },
+                onSelect = viewModel::setGrid,
+            )
+            Text(
+                "Fewer cells means larger, more readable cells and a slower transfer. Drop to " +
+                    "64 x 64 if the receiver struggles.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
             LabelledSlider(
                 label = "Cell size",
                 value = state.config.cellSizePx,
@@ -198,8 +226,10 @@ fun SenderSetupScreen(
                 suffix = " px",
             )
             Text(
-                "Each logical cell is drawn as an N x N block of screen pixels. One screen pixel " +
-                    "per cell is not recoverable by any phone camera and is not offered.",
+                "Each logical cell is drawn as an N x N block of screen pixels; this is set " +
+                    "automatically to fill the screen, because how many camera pixels land on a " +
+                    "cell decides whether anything decodes at all. One screen pixel per cell is " +
+                    "not recoverable by any phone camera and is not offered.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
